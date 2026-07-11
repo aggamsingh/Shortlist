@@ -1,0 +1,24 @@
+# CPU-only PyTorch setup to prevent large GPU download sizes
+--extra-index-url https://download.pytorch.org/whl/cpu
+torch>=2.2.0
+sentence-transformers>=2.7.0
+
+# API layer
+fastapi>=0.100.0
+uvicorn[standard]>=0.22.0
+pydantic>=2.0
+
+# Vector database
+qdrant-client>=1.9.0
+
+# CV Document parsing
+pypdf>=4.0.0
+python-docx>=1.1.0
+
+# Utilities
+python-dotenv>=1.0.0
+requests>=2.31.0
+
+# LLM Providers
+groq>=0.9.0
+google-generativeai>=0.5.0
