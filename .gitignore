@@ -1,0 +1,32 @@
+# Byte-compiled / optimized / DLL files
+__pycache__/
+*.py[cod]
+*$py.class
+
+# OS files
+.DS_Store
+Thumbs.db
+
+# Virtual Environments
+venv/
+.venv/
+env/
+ENV/
+
+# Local Configurations & Keys
+.env
+.env.local
+.env.*.local
+
+# Run logs
+*.log
+
+# Local data caches & model files (preserve folder structure)
+data/*
+!data/.gitkeep
+qdrant_storage/
+.pytest_cache/
+
+# Client CV Folder (Excludes actual resumes, preserves directory)
+cvs/*
+!cvs/.gitkeep
