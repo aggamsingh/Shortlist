@@ -15,6 +15,32 @@ COMMON_HEADERS = [
     "languages", "certifications", "achievements", "publications", "interests", "awards"
 ]
 
+# Cities recognised for metadata extraction and query-side filtering.
+# Aliases map to the single canonical spelling stored in the Qdrant payload.
+CITY_ALIASES = {
+    "bengaluru": "Bangalore",
+    "bangalore": "Bangalore",
+    "gurugram": "Gurgaon",
+    "gurgaon": "Gurgaon",
+}
+COMMON_CITIES = [
+    "delhi", "mumbai", "bangalore", "bengaluru", "noida", "gurgaon",
+    "gurugram", "pune", "hyderabad", "chennai", "kolkata"
+]
+
+def normalize_location(value: str) -> str:
+    """Map any spelling of a known city to the canonical form stored in Qdrant.
+
+    Used by the indexer when writing payloads and by the retriever when building
+    filters, so a query for "Bengaluru" matches a CV indexed as "Bangalore".
+    """
+    if not value:
+        return "Unknown"
+    key = value.strip().lower()
+    if key in CITY_ALIASES:
+        return CITY_ALIASES[key]
+    return value.strip().title()
+
 def parse_pdf(file_path: str) -> str:
     """Extract text from a PDF file."""
     try:

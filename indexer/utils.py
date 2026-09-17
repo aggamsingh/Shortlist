@@ -1,4 +1,5 @@
 import os
+import time
 import hashlib
 import json
 import logging
@@ -52,3 +53,35 @@ def save_index_state(state_path: str, state: dict) -> None:
             json.dump(state, f, indent=2, ensure_ascii=False)
     except Exception as e:
         logger.error(f"Failed to save index state to {state_path}: {e}")
+
+def connect_qdrant(host: str, port: int, attempts: int = 10, delay: float = 2.0,
+                   client_factory=None):
+    """Connect to Qdrant, retrying while the server finishes starting.
+
+    Under Docker Compose the database and the app start together, so the first
+    connection usually races container startup. Retrying here is more reliable
+    than gating on a compose healthcheck: it also covers a Qdrant restart while
+    the API is already running, which a startup-only healthcheck never sees.
+    """
+    from qdrant_client import QdrantClient
+
+    factory = client_factory or (lambda: QdrantClient(host=host, port=port))
+    last_error = None
+    for attempt in range(1, attempts + 1):
+        try:
+            client = factory()
+            client.get_collections()  # force a real round trip
+            if attempt > 1:
+                logger.info(f"Connected to Qdrant at {host}:{port} on attempt {attempt}.")
+            return client
+        except Exception as e:
+            last_error = e
+            if attempt < attempts:
+                logger.warning(
+                    f"Qdrant not reachable at {host}:{port} "
+                    f"(attempt {attempt}/{attempts}): {e}. Retrying in {delay}s."
+                )
+                time.sleep(delay)
+    raise ConnectionError(
+        f"Could not reach Qdrant at {host}:{port} after {attempts} attempts: {last_error}"
+    )
