@@ -1,5 +1,3 @@
-version: '3.8'
-
 services:
   qdrant:
     image: qdrant/qdrant:latest
@@ -10,11 +8,16 @@ services:
     volumes:
       - qdrant_data:/qdrant/storage
     restart: unless-stopped
-    healthcheck:
-      test: ["CMD", "curl", "-f", "http://localhost:6333/health"]
-      interval: 10s
-      timeout: 5s
-      retries: 3
+    # No healthcheck here on purpose. The previous one ran
+    # `curl -f http://localhost:6333/health`, which is doubly unsafe: Qdrant
+    # serves /healthz (not /health), and the official image is not guaranteed to
+    # ship curl. Because `app` gated on `condition: service_healthy`, a failing
+    # probe meant the API never started at all.
+    #
+    # Readiness is handled application-side instead, by connect_qdrant() in
+    # indexer/utils.py, which retries with backoff and verifies a real round
+    # trip. That also covers a Qdrant restart while the API is already up --
+    # something a startup-only healthcheck never catches.
 
   app:
     build:
@@ -32,9 +35,15 @@ services:
       - ${CV_FOLDER_PATH:-./cvs}:/app/cvs
       - ./data:/app/data
     depends_on:
-      qdrant:
-        condition: service_healthy
+      - qdrant
     restart: unless-stopped
+    healthcheck:
+      # The API image installs curl, so this probe is safe here.
+      test: ["CMD", "curl", "-fsS", "http://localhost:8000/health"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 90s
 
   indexer:
     build:
@@ -50,9 +59,11 @@ services:
       - ${CV_FOLDER_PATH:-./cvs}:/app/cvs
       - ./data:/app/data
     depends_on:
-      qdrant:
-        condition: service_healthy
-    entrypoint: ["python", "indexer/run.py"]
+      - qdrant
+    # Run as a module so /app is on sys.path. `python indexer/run.py` puts
+    # /app/indexer on sys.path instead, and `from indexer.utils import ...`
+    # then fails with ModuleNotFoundError.
+    entrypoint: ["python", "-m", "indexer.run"]
 
 volumes:
   qdrant_data:
