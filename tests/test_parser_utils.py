@@ -18,7 +18,6 @@ from indexer.parser import (
 from indexer.run import clean_candidate_name, extract_location
 from indexer.utils import calculate_file_hash, load_index_state, save_index_state
 import tempfile
-import json
 
 
 class TestTextCleaning(unittest.TestCase):
