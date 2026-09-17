@@ -1,27 +1,6 @@
 import unittest
-from unittest.mock import MagicMock, patch
+from unittest.mock import MagicMock
 import os
-
-# Setup environment variables for testing
-os.environ["API_KEY"] = "test-secret-key"
-os.environ["QDRANT_HOST"] = "localhost"
-os.environ["QDRANT_PORT"] = "6333"
-os.environ["QDRANT_COLLECTION"] = "test-resumes"
-os.environ["DEFAULT_TOP_K"] = "5"
-os.environ["RETRIEVAL_TOP_N"] = "10"
-
-# Start global mocks before any project code import to prevent network/DB requests
-patcher_transformer = patch('sentence_transformers.SentenceTransformer')
-mock_transformer_cls = patcher_transformer.start()
-mock_transformer_instance = MagicMock()
-mock_transformer_instance.get_sentence_embedding_dimension.return_value = 384
-mock_transformer_instance.encode.return_value = [[0.1] * 384]
-mock_transformer_cls.return_value = mock_transformer_instance
-
-patcher_qdrant = patch('qdrant_client.QdrantClient')
-mock_qdrant_cls = patcher_qdrant.start()
-mock_qdrant_instance = MagicMock()
-mock_qdrant_cls.return_value = mock_qdrant_instance
 
 from indexer.parser import clean_text, extract_years_of_experience, chunk_cv
 from indexer.run import clean_candidate_name, extract_location
@@ -29,6 +8,18 @@ from api.main import app
 import api.main as main_module
 
 from fastapi.testclient import TestClient
+
+# These tests replace api.main's singletons directly instead of patching
+# sentence_transformers / qdrant_client globally. Importing api.main builds
+# neither: both are constructed in the lifespan handler, which TestClient runs
+# only as a context manager. The previous module-level patchers stayed active
+# for the rest of the process and handed a mocked model to the e2e suite --
+# CVEmbedder is a singleton, so the mock outlived this module.
+
+
+def setUpModule():
+    os.environ["API_KEY"] = "test-secret-key"
+    os.environ["DEFAULT_TOP_K"] = "5"
 
 class TestParserAndUtils(unittest.TestCase):
     def test_clean_text(self):
@@ -146,11 +137,6 @@ class TestAPIEndpoints(unittest.TestCase):
         self.assertEqual(len(data["candidates"]), 1)
         self.assertEqual(data["candidates"][0]["name"], "Jane Doe")
         self.assertEqual(data["candidates"][0]["score"], 0.95)
-
-# Stop patchers when file exits, but keep active during tests
-def tearDownModule():
-    patcher_transformer.stop()
-    patcher_qdrant.stop()
 
 if __name__ == "__main__":
     unittest.main()
