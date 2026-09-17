@@ -1,4 +1,3 @@
-import os
 from sentence_transformers import SentenceTransformer
 from indexer.utils import get_logger
 
@@ -21,7 +20,11 @@ class CVEmbedder:
         try:
             # Force CPU execution
             self.model = SentenceTransformer(model_name, device="cpu")
-            self.dimension = self.model.get_sentence_embedding_dimension()
+            # Support both old and new API for embedding dimension
+            if hasattr(self.model, 'get_embedding_dimension'):
+                self.dimension = self.model.get_embedding_dimension()
+            else:
+                self.dimension = self.model.get_sentence_embedding_dimension()
             logger.info(f"Model loaded successfully. Embedding dimension: {self.dimension}")
         except Exception as e:
             logger.error(f"Failed to load sentence-transformers model: {e}")

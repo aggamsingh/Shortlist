@@ -1,13 +1,26 @@
 import os
+import re
 import uuid
-from datetime import datetime
+from datetime import datetime, timezone
 from dotenv import load_dotenv
 from qdrant_client import QdrantClient
 from qdrant_client.http import models
 
 # Import our custom modules
-from indexer.utils import get_logger, calculate_file_hash, load_index_state, save_index_state
-from indexer.parser import parse_cv, extract_years_of_experience
+from indexer.utils import (
+    get_logger,
+    calculate_file_hash,
+    connect_qdrant,
+    load_index_state,
+    save_index_state,
+)
+from indexer.parser import (
+    parse_cv,
+    extract_years_of_experience,
+    chunk_cv,
+    normalize_location,
+    COMMON_CITIES,
+)
 from indexer.embedder import CVEmbedder
 
 # Load environment variables
@@ -21,34 +34,23 @@ QDRANT_HOST = os.getenv("QDRANT_HOST", "localhost")
 QDRANT_PORT = int(os.getenv("QDRANT_PORT", "6333"))
 QDRANT_COLLECTION = os.getenv("QDRANT_COLLECTION", "resumes")
 STATE_FILE_PATH = os.getenv("STATE_FILE_PATH", "./data/index_state.json")
+# When set, Qdrant runs embedded from this directory instead of over the network
+# (no server, no Docker). Embedded mode holds an exclusive lock, so index first
+# and start the API afterwards.
+QDRANT_PATH = os.getenv("QDRANT_PATH")
 
-# Common cities for basic location filter extraction
-COMMON_CITIES = [
-    "delhi", "mumbai", "bangalore", "bengaluru", "noida", "gurgaon", 
-    "gurugram", "pune", "hyderabad", "chennai", "kolkata"
-]
+def word_boundary(term: str) -> str:
+    """Regex matching `term` as a whole word."""
+    return r"\b" + re.escape(term) + r"\b"
 
 def extract_location(text: str) -> str:
     """Basic extraction of location based on common cities."""
     text_lower = text.lower()
     for city in COMMON_CITIES:
         # Match city with word boundaries
-        if re_match := re_search(rf"\b{city}\b", text_lower):
-            # Normalize Bengaluru to Bangalore
-            if city in ["bengaluru", "bangalore"]:
-                return "Bangalore"
-            if city in ["gurugram", "gurgaon"]:
-                return "Gurgaon"
-            return city.capitalize()
+        if re.search(word_boundary(city), text_lower):
+            return normalize_location(city)
     return "Unknown"
-
-# We need regex for word boundary matching
-import re
-def re_search(pattern: str, text: str):
-    try:
-        return re.search(pattern, text)
-    except Exception:
-        return None
 
 def clean_candidate_name(filename: str) -> str:
     """Generate a clean candidate name from the file name."""
@@ -70,13 +72,48 @@ def clean_candidate_name(filename: str) -> str:
         return "Unknown Candidate"
     return name_part.title()
 
+# Payload fields that must be indexed in Qdrant.
+#   candidate_id -> grouped retrieval (query_points_groups) and stale-vector deletes
+#   location / years_of_experience -> screening filters
+# Without these, Qdrant still answers correctly but falls back to a full payload
+# scan, which does not hold up at a few hundred thousand chunks.
+PAYLOAD_INDEXES = {
+    "candidate_id": models.PayloadSchemaType.KEYWORD,
+    "location": models.PayloadSchemaType.KEYWORD,
+    "years_of_experience": models.PayloadSchemaType.INTEGER,
+}
+
+
+def ensure_payload_indexes(qdrant_client) -> None:
+    """Create payload indexes if absent. Safe to call on every run."""
+    for field_name, schema in PAYLOAD_INDEXES.items():
+        try:
+            qdrant_client.create_payload_index(
+                collection_name=QDRANT_COLLECTION,
+                field_name=field_name,
+                field_schema=schema,
+            )
+            logger.info(f"Created payload index on '{field_name}'.")
+        except Exception as e:
+            # Qdrant returns an error when the index already exists; that is the
+            # normal path on re-runs and must not abort indexing.
+            logger.debug(f"Payload index on '{field_name}' not created ({e}); assuming it exists.")
+
+
 def main():
     logger.info("Starting CV Indexing pipeline...")
     
     # 1. Connect to Qdrant
     try:
-        qdrant_client = QdrantClient(host=QDRANT_HOST, port=QDRANT_PORT)
-        logger.info(f"Connected to Qdrant at {QDRANT_HOST}:{QDRANT_PORT}")
+        if QDRANT_PATH:
+            qdrant_client = QdrantClient(path=QDRANT_PATH)
+            logger.info(f"Opened embedded Qdrant at {QDRANT_PATH}")
+        else:
+            qdrant_client = connect_qdrant(
+                QDRANT_HOST, QDRANT_PORT,
+                client_factory=lambda: QdrantClient(host=QDRANT_HOST, port=QDRANT_PORT),
+            )
+            logger.info(f"Connected to Qdrant at {QDRANT_HOST}:{QDRANT_PORT}")
     except Exception as e:
         logger.critical(f"Failed to connect to Qdrant: {e}")
         return
@@ -104,6 +141,7 @@ def main():
             logger.info(f"Collection '{QDRANT_COLLECTION}' created successfully.")
         else:
             logger.info(f"Collection '{QDRANT_COLLECTION}' already exists.")
+        ensure_payload_indexes(qdrant_client)
     except Exception as e:
         logger.critical(f"Error checking/creating Qdrant collection: {e}")
         return
@@ -209,7 +247,9 @@ def main():
                     payload={
                         "candidate_id": str(candidate_uuid),
                         "name": candidate_name,
-                        "cv_path": file_path,
+                        # Normalise separators: os.path.join on Windows yields
+                        # mixed "C:/a/b\c.docx", which looks broken in JSON.
+                        "cv_path": file_path.replace(os.sep, "/"),
                         "chunk_text": chunk,
                         "years_of_experience": years_exp,
                         "location": location
@@ -226,7 +266,7 @@ def main():
             # Update index state
             state[file_path] = {
                 "hash": file_hash,
-                "indexed_at": datetime.utcnow().isoformat() + "Z",
+                "indexed_at": datetime.now(timezone.utc).isoformat(timespec="seconds").replace("+00:00", "Z"),
                 "candidate_name": candidate_name,
                 "candidate_id": str(candidate_uuid)
             }
