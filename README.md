@@ -1,163 +1,231 @@
-# Resume Screening Microservice
+# Resume Screener
 
-A production-ready, self-contained, CPU-only resume screening microservice. It implements a Retrieval-Augmented Generation (RAG) pipeline to fetch matching resume chunks from a Qdrant vector database and rerank them using Groq or Gemini API.
+A CPU-only microservice that takes a job description and returns the best-matching candidates from a corpus of CVs, each with a relevance score and a one-line justification.
 
-## Features
-- **Incremental Indexing**: Skips unmodified resumes using MD5 hashing (saved in `./data/index_state.json`).
-- **Rich Document Parsing**: Supports both PDF and DOCX CVs (including tables parsing).
-- **CPU-Optimized**: Uses a CPU-only PyTorch build to keep Docker image size small (~80MB embedding model).
-- **Robust Reranking**: Intelligently groups chunks, builds candidate summaries, and queries Gemini/Groq under JSON schemas.
+It is a two-stage retrieval system: fast vector search over chunked resumes narrows thousands of CVs to a shortlist, then an LLM reranks that shortlist against the full job description. Retrieval quality is measured, not asserted — see [Evaluation](#evaluation).
 
----
-
-## 🛠 Setup & Installation
-
-### 1. Place Resumes
-Create a directory named `cvs` in the root of the project folder (if it doesn't already exist), and place all candidate CV files (`.pdf` and `.docx`) inside:
-```bash
-mkdir cvs
-# copy your CVs into the cvs folder
 ```
-
-### 2. Configure Environment Variables
-Copy the configuration template:
-```bash
-cp .env.example .env
-```
-Open the new `.env` file and set:
-- **`GROQ_API_KEY`** or **`GEMINI_API_KEY`**: Provide at least one API key to perform candidate reranking. (If both are set, Gemini is used by default).
-- **`API_KEY`**: Your internal shared API key used to secure the service. Example: `API_KEY=my_secure_handshake_key`
-- **`CV_FOLDER_PATH`**: Host path pointing to your CV storage folder (defaults to `./cvs`).
-
----
-
-## 🚀 Running the Service
-
-### 1. Build and Run the Vector DB and API Server
-Spin up Qdrant and the FastAPI API server to run 24/7 in the background:
-```bash
-docker compose up -d
-```
-Verify the server is running by viewing the logs:
-```bash
-docker compose logs -f app
-```
-
-### 2. Run the Resume Indexer
-Whenever you add new CVs or update existing ones, trigger the indexer script to index the resumes:
-```bash
-docker compose run indexer
-```
-*Note: Thanks to hashing logic, subsequent index runs only process new or modified files, preserving bandwidth and CPU resources.*
-
-### 3. Stop the Service
-To temporarily stop the database and API server:
-```bash
-docker compose down
+CVs (PDF/DOCX) ──> parse ──> chunk ──> embed ──> Qdrant
+                                                   │
+job description ──> embed ──────> vector search ───┤ grouped by candidate
+                                                   ▼
+                                          shortlist (N distinct people)
+                                                   │
+                                                   ▼
+                                          LLM rerank (Gemini / Groq)
+                                                   │
+                                                   ▼
+                                       scored candidates + reasoning
 ```
 
 ---
 
-## 📡 API Endpoints
+## Quick start
 
-All client requests must include the header: `X-API-Key: <your_internal_api_key_here>`.
+No Docker and no database server required — Qdrant can run embedded from a local directory.
 
-### 1. Screen Resumes
-**Endpoint:** `POST /api/v1/screen`
+```bash
+pip install -r requirements.txt
+cp .env.example .env          # set API_KEY; LLM keys are optional
 
-**Request Headers:**
-```http
-X-API-Key: your_internal_api_key_here
-Content-Type: application/json
+export QDRANT_PATH=./data/qdrant     # embedded mode
+export CV_FOLDER_PATH=./cvs          # drop some .pdf / .docx CVs here
+
+python -m indexer.run                # build the index
+python -m uvicorn api.main:app --port 8000
 ```
 
-**Request Body (JSON):**
-```json
-{
-  "job_description": "We are seeking a Backend Software Engineer with 3+ years of experience in Python, FastAPI, Docker, and Qdrant. The engineer will build microservices and vector search components. Based in Delhi.",
-  "top_k": 5,
-  "filters": {
-    "min_experience": 3,
-    "location": "Delhi"
-  }
-}
-```
-
-**Example Curl Command:**
 ```bash
 curl -X POST http://localhost:8000/api/v1/screen \
-  -H "X-API-Key: your_internal_api_key_here" \
-  -H "Content-Type: application/json" \
-  -d '{
-    "job_description": "Seeking Python engineer with 3+ years experience, based in Delhi",
-    "top_k": 5,
-    "filters": {
-      "min_experience": 3,
-      "location": "Delhi"
-    }
-  }'
+  -H "X-API-Key: $API_KEY" -H "Content-Type: application/json" \
+  -d '{"job_description":"Backend engineer with Python, FastAPI and vector search","top_k":5}'
 ```
 
-**Response Body (JSON):**
-```json
-{
-  "job_id": "90ba9535-90eb-4fb6-ba64-58a69d2f2d9c",
-  "candidates": [
-    {
-      "candidate_id": "d3b07384-d113-5f8a-9293-1829e34a2e58",
-      "name": "Jane Doe",
-      "score": 0.94,
-      "match_reasoning": "Strong match with 4 years experience in Python and FastAPI, located in Delhi.",
-      "cv_path": "/app/cvs/Jane_Doe_CV.pdf"
-    }
-  ],
-  "screened_at": "2026-07-11T12:00:00Z"
-}
-```
+Embedded Qdrant takes an **exclusive file lock**, so the indexer and the API cannot run at the same time: index first, then start the API. For concurrent use, run a Qdrant server and set `QDRANT_HOST` / `QDRANT_PORT` instead.
 
-### 2. Service Health Check
-**Endpoint:** `GET /health`
+### With Docker
 
-**Example Curl Command:**
 ```bash
-curl http://localhost:8000/health
-```
-
-**Response Body (JSON):**
-```json
-{
-  "status": "healthy",
-  "qdrant_connected": true,
-  "model_loaded": true,
-  "llm_configured": true
-}
+docker compose up -d          # Qdrant + API
+docker compose run indexer    # index whatever is in CV_FOLDER_PATH
 ```
 
 ---
 
-## 📂 Project Structure
-```
-resume-screener/
-├── docker-compose.yml     # Compose file orchestrating services
-├── Dockerfile             # Core python image configuration
-├── .env.example           # Config file template
-├── requirements.txt       # Core dependencies (CPU-only PyTorch)
-├── indexer/
-│   ├── run.py             # Main indexing script
-│   ├── parser.py          # CV parsers (PDF, DOCX) & heading chunker
-│   ├── embedder.py        # SentenceTransformer CPU singleton
-│   └── utils.py           # Logging, hashing, and state file utils
-├── api/
-│   ├── main.py            # FastAPI endpoints and lifespans
-│   ├── retriever.py       # Qdrant queries & candidate deduplication
-│   ├── reranker.py        # Groq/Gemini JSON mode call logic
-│   └── models.py          # Pydantic request/response schemas
-├── cvs/                   # Folder where resumes are dropped
-└── data/                  # Persistent data folder (caching models and hashes)
+## How it works
+
+### Indexing (`indexer/`)
+
+1. **Incremental scan** — each file is MD5-hashed and compared against `data/index_state.json`. Unchanged CVs are skipped, so re-indexing a large corpus after adding ten CVs costs ten CVs of work.
+2. **Parsing** — `pypdf` for PDFs, `python-docx` for DOCX *including table cells*, since a lot of resumes put work history in tables that a paragraph-only reader silently drops.
+3. **Metadata extraction** — years of experience by regex, location against a known-city list, candidate name from the filename. This is the weakest part of the system and is discussed honestly under [Limitations](#limitations).
+4. **Chunking** — split on resume section headings (`Experience`, `Skills`, …), with a 200-word sliding window as fallback for CVs with no recognisable structure.
+5. **Embedding** — `all-MiniLM-L6-v2` (384-dim), pinned to CPU. Small, fast, and good enough that the reranker does the hard discrimination.
+6. **Upsert** — deterministic UUID5 point ids derived from the candidate id, so re-indexing an edited CV replaces its vectors instead of accumulating duplicates. Stale vectors are deleted first.
+
+### Serving (`api/`)
+
+`POST /api/v1/screen` embeds the JD, applies hard filters in Qdrant, retrieves a shortlist, reranks, and returns the top `k`. `GET /health` reports Qdrant connectivity, model load, and whether an LLM is actually configured.
+
+---
+
+## Design decisions
+
+### Retrieval is grouped by candidate, not by chunk
+
+A naive top-N chunk search returns *chunks*, and one verbose CV can occupy many of the N slots. The reranker then gets a handful of people instead of N, and a candidate that vector search ranked 8th never gets the chance to be promoted.
+
+Qdrant's `query_points_groups` groups hits by `candidate_id`, guaranteeing N **distinct** candidates while still surfacing each one's best-matching chunks. On the within-role query set, this raises the share of relevant candidates that reach the reranker from **0.617 to 0.822** at the same retrieval budget. That number is the ceiling on final quality: a reranker can reorder what it is given, but it can never recover a candidate retrieval dropped.
+
+### The reranker is treated as an untrusted input
+
+LLM output is the least reliable input in the system, so `api/reranker.py` assumes it will be malformed:
+
+- **Identity is never taken from the model.** Scores and reasoning come from the LLM; `candidate_id`, `name` and `cv_path` always come from the index, so a hallucinated candidate cannot reach the response.
+- **Score scale is inferred across the batch, not per value.** Models asked for `0.00–1.00` sometimes answer `0–10` or `0–100`. Judging each value alone would map a lone `1.5` to `0.015` and rank the model's *best* pick last; judging the batch together preserves the model's ordering, which is the part of its answer that actually matters.
+- **Reranked candidates are ordered ahead of fallbacks.** An LLM score and a cosine similarity are different units, so interleaving them by raw value would let an unjudged `0.6` cosine outrank a judged `0.55`.
+- **A provider outage degrades, it does not 500.** With no key or a failed call, the service returns vector-similarity ordering and says so in `match_reasoning`.
+- **Prompt size is capped** per candidate and per request, because concatenated chunks are otherwise unbounded input to a metered API.
+
+### Readiness is handled in the application, not by a compose healthcheck
+
+The database and API start together, so the first connection races container startup. `connect_qdrant()` retries with backoff and verifies a real round trip. This also survives a Qdrant restart while the API is already running — something a startup-only healthcheck never sees.
+
+### Configuration is read per request, not at import
+
+Binding config at import time makes behaviour depend on whether `.env` loaded before the module was first imported. That bug was live here: `api/retriever.py` read `QDRANT_HOST` at import while `load_dotenv()` ran afterwards, so those `.env` values were silently ignored outside Docker.
+
+---
+
+## Evaluation
+
+Retrieval quality is measured against a labelled synthetic corpus: **32 CVs, 8 job descriptions, graded relevance** (2 = would shortlist, 1 = plausible, 0 = not a fit).
+
+```bash
+python -m evaluation.run_eval --ablations
 ```
 
-## 🔧 Troubleshooting
+Two query sets, because they measure very different things:
 
-- **Hugging Face model downloads on restarts**: The system mounts `/app/data` to preserve the `hf_home` directory. The embedding model is cached there during the very first startup or run and is reused afterwards, saving network load.
-- **Out of Memory / High CPU during Indexing**: The indexer processes resumes one-by-one and chunks them in batches. Ensure the host system has at least 2GB of free RAM.
-- **Port Conflicts**: If port `6333` (Qdrant) or `8000` (FastAPI) is occupied by other software on your server, change them in your `.env` file.
+- **Cross-role** — five different jobs (backend, frontend, ML, DevOps, data). Any embedding model separates a React CV from a Kubernetes CV, so these saturate near the ceiling.
+- **Within-role** — three jobs where *every* strong candidate is a Python backend engineer and only one specific requirement separates them (production vector-database experience; deep asyncio; owning your own infra). Keyword overlap on "Python", "backend", "API" is near-uniform here and carries no signal. **This is the set that discriminates.**
+
+A quarter of the corpus is deliberate distractors: a QA engineer whose CV is dense with Python, a technical writer who documents FastAPI, a Java engineer whose resume says "backend microservices Docker". A keyword matcher scores well without them.
+
+### Results (retrieval only, k=5, budget=10)
+
+| configuration | recall@5 | nDCG@5 | pool recall | distinct candidates |
+|---|---|---|---|---|
+| **Cross-role** | | | | |
+| whole CV + flat | 0.870 | 0.920 | 0.960 | 10.0 |
+| section + flat | 0.830 | 0.799 | 0.870 | 5.6 |
+| section + grouped | 0.830 | 0.799 | **0.960** | **10.0** |
+| **Within-role** | | | | |
+| whole CV + flat | 0.428 | 0.566 | 0.550 | 6.0 |
+| whole CV + grouped | 0.428 | 0.566 | **0.822** | **10.0** |
+| window60 + grouped | **0.467** | **0.639** | **0.878** | 10.0 |
+| section + flat | 0.494 | 0.605 | 0.617 | 7.7 |
+| section + grouped | **0.494** | 0.605 | 0.822 | 10.0 |
+
+**What this actually shows:**
+
+1. **Grouping is the clear win.** It never hurts ranking and consistently raises pool recall — 0.617 → 0.822 for section chunking, 0.550 → 0.822 for whole-CV. Flat retrieval was silently discarding a third of the relevant candidates before the reranker ever saw them.
+2. **The cross-role set is nearly useless as a benchmark.** It sits at 0.92 nDCG for almost every configuration. Reporting only these numbers would make the system look better than it is.
+3. **Section chunking does not clearly earn its complexity.** It wins on within-role recall (0.494 vs 0.428) but *loses* on cross-role nDCG (0.799 vs 0.920), and a plain 60-word window beats it on within-role nDCG (0.639 vs 0.605). On this corpus the evidence does not support the fancier strategy.
+
+**Caveat, stated plainly:** 3 within-role queries over 32 synthetic CVs is a small sample. Differences of 0.03–0.04 nDCG are well inside the noise one query would produce, and these fixtures are short and uniformly structured, which flatters whole-CV embedding. These numbers justify the grouping change; they are *not* enough to retire section chunking. The honest next step is more queries and longer, messier CVs.
+
+### Reranker evaluation — not yet measured
+
+**Every number above is LLM-free.** The reranker has never been run against a real
+provider, because no API key was available during development. Rather than
+guess at a result, the reranker row is simply absent.
+
+To fill it in, add a key to `.env` and verify it first:
+
+```bash
+python -m evaluation.check_llm      # ONE real call; confirms key + model id work
+```
+
+It sends three candidates whose correct ranking is unambiguous — a retrieval
+engineer with production vector-database experience, a Django developer, and a
+frontend developer who is given the *highest* vector score on purpose. A working
+reranker must put the retrieval engineer first and the frontend developer last,
+overriding the vector order. It reports exactly what came back, so a retired
+model id or a mis-scoped key shows up immediately rather than as a silent empty
+rerank ten minutes into an evaluation.
+
+Then:
+
+```bash
+python -m evaluation.run_eval --ablations --rerank
+```
+
+Reranking is where the within-role gap (nDCG 0.605) should close: the
+discriminating requirement is stated plainly in each JD and present in the
+resume text, and the embedding model simply does not weight it heavily enough.
+Whether that actually happens is an open question, and the README will say so
+until someone runs it.
+
+The rerank *plumbing* is covered by tests against a stubbed provider
+(`tests/test_eval_harness.py`), so the code path is known to work end to end —
+prompt construction, JSON parsing, score normalisation and merging. Only the
+network call itself is unexercised.
+
+---
+
+## Testing
+
+```bash
+python -m unittest discover -s tests -t . -v      # 134 tests
+```
+
+Qdrant runs embedded, so the end-to-end tests need no server and run in CI.
+
+The original repository had 32 passing tests and a service that could not index a single CV: `indexer/run.py` called `chunk_cv` without importing it, and every test mocked the boundary so nothing ever executed `main()`. The suite now drives the real entry point with real `.docx` files and real vectors, and covers:
+
+- **Pipeline** — indexing, incremental hash skipping, re-indexing an edited CV without leaving stale vectors, corrupt files not aborting a run.
+- **Reranker** — hallucinated ids, duplicate ids, omitted candidates, null scores, wrong numeric scales, non-JSON responses, provider outage.
+- **Metrics** — every ranking metric checked against hand-computed values, because the quality claims above rest on them.
+- **API** — auth, request validation, response contract.
+- **Eval harness** — including the `--rerank` branch, run against a stubbed provider so it cannot rot while no API key is available. Stubs prove plumbing only; no stub-derived number is ever reported as a quality result.
+
+Test isolation is verified by running the suite forwards, backwards, and one module at a time. That check found a real bug: two modules patched `sentence_transformers` globally and `CVEmbedder` is a singleton, so a mocked model leaked into the end-to-end tests.
+
+---
+
+## Configuration
+
+Every value lives in `.env` — see `.env.example` for the annotated list. The ones that matter:
+
+| Variable | Default | Purpose |
+|---|---|---|
+| `API_KEY` | — | Shared key for `X-API-Key`. **If unset, `/screen` is unauthenticated.** |
+| `GEMINI_API_KEY` / `GROQ_API_KEY` | — | At least one enables reranking. Gemini is tried first, Groq is the fallback. |
+| `QDRANT_PATH` | — | Run Qdrant embedded from this directory (no server). |
+| `QDRANT_HOST` / `QDRANT_PORT` | `localhost` / `6333` | Qdrant server, when not embedded. |
+| `RETRIEVAL_CANDIDATES` | `30` | Distinct **candidates** retrieved for reranking (not chunks). |
+| `MAX_CHARS_PER_CANDIDATE` | `1200` | Cap on resume text per candidate sent to the LLM. |
+
+---
+
+## Limitations
+
+Known and deliberate, rather than hidden:
+
+- **Metadata extraction is naive.** Years of experience is a regex over phrases like "5 years of experience"; a CV that only lists date ranges yields `0`. Location matches a hardcoded list of eleven Indian cities. Candidate name comes from the *filename*. This is a cost decision — an LLM extraction pass per CV is accurate but expensive at 200k resumes — and the right design is a cheap regex fast path with an LLM fallback only when it fails. That fallback is not built yet.
+- **Location filtering is exact-match on a guessed city.** No geocoding, no radius, no remote handling.
+- **The evaluation corpus is synthetic and small.** Real resumes cannot be committed to a public repo, but these fixtures are cleaner and more uniformly structured than real CVs, so the absolute numbers are optimistic. The *relative* comparisons between configurations are the useful part.
+- **No OCR.** Scanned image-only PDFs extract no text and are skipped with a warning.
+- **Reranker latency is untested at scale.** Measured stages so far: embedding 33–74 ms, retrieval ~2.4 ms. The LLM call will dominate and has not been measured.
+- **The Docker image build is unverified.** The Docker daemon was unavailable during development, so `docker compose up` has not been executed end-to-end. Everything else here was run for real.
+- **Model ids drift.** `gemini-2.5-flash` and `llama-3.3-70b-versatile` are the defaults and are configurable via `GEMINI_MODEL` / `GROQ_MODEL`. Verify they are current for your account.
+
+## Next steps
+
+In rough priority order:
+
+1. Run the reranker evaluation with a real key and record the delta — this is the single biggest open question about the system.
+2. Expand the corpus with longer, messier CVs and more within-role queries, then revisit whether section chunking earns its place.
+3. Add the LLM metadata-extraction fallback for CVs where the regex finds nothing.
+4. Hybrid retrieval — combine vector similarity with BM25 keyword matching, which typically helps on exact technology names.
