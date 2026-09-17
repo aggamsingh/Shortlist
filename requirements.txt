@@ -1,24 +1,32 @@
-# CPU-only PyTorch setup to prevent large GPU download sizes
---extra-index-url https://download.pytorch.org/whl/cpu
-torch>=2.2.0
-sentence-transformers>=2.7.0
+# CPU-only PyTorch. --extra-index-url ADDS a source rather than replacing PyPI,
+# so pip may still resolve the CUDA build from PyPI and pull ~2GB of GPU wheels.
+# --index-url makes the CPU index authoritative for torch.
+--index-url https://download.pytorch.org/whl/cpu
+--extra-index-url https://pypi.org/simple
+
+torch~=2.13
+sentence-transformers~=5.1
 
 # API layer
-fastapi>=0.100.0
-uvicorn[standard]>=0.22.0
-pydantic>=2.0
+fastapi~=0.115
+uvicorn[standard]~=0.32
+pydantic~=2.9
 
-# Vector database
-qdrant-client>=1.9.0
+# Vector database.
+# Pinned to the 1.x line that has query_points / query_points_groups. The
+# previous `>=1.9.0` silently resolved to 1.18, where the `.search()` call this
+# service used had been removed -- a fresh install broke retrieval outright.
+qdrant-client~=1.18
 
-# CV Document parsing
-pypdf>=4.0.0
-python-docx>=1.1.0
+# CV document parsing
+pypdf~=6.14
+python-docx~=1.1
 
 # Utilities
-python-dotenv>=1.0.0
-requests>=2.31.0
+python-dotenv~=1.0
+requests~=2.32
 
-# LLM Providers
-groq>=0.9.0
-google-generativeai>=0.5.0
+# LLM rerankers. Only the configured provider is imported at runtime
+# (see api/reranker.py), so one key is enough to run the service.
+groq~=1.5
+google-generativeai~=0.8
