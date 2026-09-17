@@ -1,106 +1,141 @@
 import os
+
 from qdrant_client import QdrantClient
 from qdrant_client.http import models
+
 from api.models import ScreeningFilters
-from indexer.utils import get_logger
+from indexer.utils import connect_qdrant, get_logger
+from indexer.parser import normalize_location
 
 logger = get_logger("api.retriever")
 
-QDRANT_HOST = os.getenv("QDRANT_HOST", "localhost")
-QDRANT_PORT = int(os.getenv("QDRANT_PORT", "6333"))
-QDRANT_COLLECTION = os.getenv("QDRANT_COLLECTION", "resumes")
-RETRIEVAL_TOP_N = int(os.getenv("RETRIEVAL_TOP_N", "30"))
 
 class CVRetriever:
-    def __init__(self):
-        logger.info(f"Connecting CVRetriever to Qdrant at {QDRANT_HOST}:{QDRANT_PORT}")
-        self.client = QdrantClient(host=QDRANT_HOST, port=QDRANT_PORT)
-        self.collection_name = QDRANT_COLLECTION
+    """Vector search over indexed CV chunks, grouped back into candidates.
 
-    def search_candidates(self, query_vector: list[float], filters: ScreeningFilters, top_n: int = None) -> list[dict]:
-        """
-        Search candidates in Qdrant based on JD vector and filters.
-        Deduplicates chunks by candidate, merging the text.
-        """
-        if top_n is None:
-            top_n = RETRIEVAL_TOP_N
-            
-        # Build filter conditions
+    Retrieval is grouped by ``candidate_id`` rather than returning a flat list of
+    chunks. A flat top-N chunk search lets one verbose CV occupy many of the N
+    slots, which starves the reranker of candidates to compare; grouping
+    guarantees N *distinct* candidates while still surfacing each one's best
+    matching chunks.
+    """
+
+    def __init__(self, client: QdrantClient = None):
+        # Config is read here rather than at module import so that callers (and
+        # tests) can set the environment before constructing the retriever.
+        self.host = os.getenv("QDRANT_HOST", "localhost")
+        self.port = int(os.getenv("QDRANT_PORT", "6333"))
+        self.collection_name = os.getenv("QDRANT_COLLECTION", "resumes")
+
+        # How many distinct candidates to pull back for reranking. RETRIEVAL_TOP_N
+        # is the historical name for this knob and is still honoured.
+        self.retrieval_candidates = int(
+            os.getenv("RETRIEVAL_CANDIDATES", os.getenv("RETRIEVAL_TOP_N", "30"))
+        )
+        # Best-matching chunks kept per candidate to build its summary.
+        self.chunks_per_candidate = int(os.getenv("CHUNKS_PER_CANDIDATE", "3"))
+
+        # QDRANT_PATH runs Qdrant embedded from a local directory, so the whole
+        # service works with no server and no Docker. Embedded mode takes an
+        # exclusive file lock, so the indexer and the API cannot hold it at the
+        # same time -- index first, then start the API. Use host/port for
+        # anything beyond a local demo.
+        self.path = os.getenv("QDRANT_PATH")
+
+        if client is not None:
+            self.client = client
+        elif self.path:
+            logger.info(f"Opening embedded Qdrant at {self.path}")
+            self.client = QdrantClient(path=self.path)
+        else:
+            logger.info(f"Connecting CVRetriever to Qdrant at {self.host}:{self.port}")
+            self.client = connect_qdrant(
+                self.host, self.port,
+                client_factory=lambda: QdrantClient(host=self.host, port=self.port),
+            )
+
+    def _build_filter(self, filters: ScreeningFilters):
+        """Translate API filters into a Qdrant filter, or None if unfiltered."""
         conditions = []
         if filters:
             if filters.min_experience is not None:
                 conditions.append(
                     models.FieldCondition(
                         key="years_of_experience",
-                        range=models.Range(gte=filters.min_experience)
+                        range=models.Range(gte=filters.min_experience),
                     )
                 )
             if filters.location:
-                # Match location case-insensitively using MatchValue and title-case
+                # Normalized through the same helper the indexer used when writing
+                # the payload, so alias spellings ("Bengaluru") match "Bangalore".
                 conditions.append(
                     models.FieldCondition(
                         key="location",
-                        match=models.MatchValue(value=filters.location.strip().capitalize())
+                        match=models.MatchValue(value=normalize_location(filters.location)),
                     )
                 )
+        return models.Filter(must=conditions) if conditions else None
 
-        query_filter = models.Filter(must=conditions) if conditions else None
+    def search_candidates(
+        self,
+        query_vector: list[float],
+        filters: ScreeningFilters,
+        top_n: int = None,
+    ) -> list[dict]:
+        """Return up to ``top_n`` distinct candidates ranked by best chunk score."""
+        if top_n is None:
+            top_n = self.retrieval_candidates
+
+        query_filter = self._build_filter(filters)
 
         try:
-            logger.info(f"Searching Qdrant collection '{self.collection_name}' with limit {top_n}...")
-            search_results = self.client.search(
-                collection_name=self.collection_name,
-                query_vector=query_vector,
-                query_filter=query_filter,
-                limit=top_n
+            logger.info(
+                f"Searching '{self.collection_name}' for {top_n} distinct candidates "
+                f"({self.chunks_per_candidate} chunks each)..."
             )
-            logger.info(f"Retrieved {len(search_results)} raw chunk points from Qdrant.")
+            response = self.client.query_points_groups(
+                collection_name=self.collection_name,
+                query=query_vector,
+                group_by="candidate_id",
+                limit=top_n,
+                group_size=self.chunks_per_candidate,
+                query_filter=query_filter,
+                with_payload=True,
+            )
         except Exception as e:
             logger.error(f"Error querying Qdrant: {e}")
             raise
 
-        # Deduplicate and group by candidate_id
-        candidates_map = {}
-        for hit in search_results:
-            payload = hit.payload
-            cand_id = payload.get("candidate_id")
-            if not cand_id:
+        candidates = []
+        for group in response.groups:
+            hits = [h for h in group.hits if h.payload]
+            if not hits:
                 continue
-                
-            chunk_text = payload.get("chunk_text", "")
-            score = hit.score
-            
-            if cand_id not in candidates_map:
-                candidates_map[cand_id] = {
-                    "candidate_id": cand_id,
+
+            # query_points_groups returns hits ordered best-first within a group.
+            best = max(hits, key=lambda h: h.score)
+            payload = best.payload
+
+            # Preserve chunk order by relevance, dropping empties and duplicates.
+            seen, chunk_texts = set(), []
+            for h in sorted(hits, key=lambda h: h.score, reverse=True):
+                text = (h.payload or {}).get("chunk_text", "").strip()
+                if text and text not in seen:
+                    seen.add(text)
+                    chunk_texts.append(text)
+
+            candidates.append(
+                {
+                    "candidate_id": payload.get("candidate_id") or str(group.id),
                     "name": payload.get("name", "Unknown"),
                     "cv_path": payload.get("cv_path", ""),
                     "years_of_experience": payload.get("years_of_experience", 0),
                     "location": payload.get("location", "Unknown"),
-                    "max_score": score,
-                    "chunks": [chunk_text]
+                    "score": best.score,
+                    "resume_summary": "\n---\n".join(chunk_texts),
                 }
-            else:
-                if score > candidates_map[cand_id]["max_score"]:
-                    candidates_map[cand_id]["max_score"] = score
-                if chunk_text not in candidates_map[cand_id]["chunks"]:
-                    candidates_map[cand_id]["chunks"].append(chunk_text)
+            )
 
-        # Merge candidate texts and format list sorted by max_score descending
-        deduplicated_candidates = []
-        for cand_id, data in candidates_map.items():
-            merged_text = "\n---\n".join(data["chunks"])
-            deduplicated_candidates.append({
-                "candidate_id": data["candidate_id"],
-                "name": data["name"],
-                "cv_path": data["cv_path"],
-                "years_of_experience": data["years_of_experience"],
-                "location": data["location"],
-                "score": data["max_score"],
-                "resume_summary": merged_text
-            })
-
-        # Sort by initial score descending
-        deduplicated_candidates.sort(key=lambda x: x["score"], reverse=True)
-        logger.info(f"Deduplicated to {len(deduplicated_candidates)} unique candidates.")
-        return deduplicated_candidates
+        candidates.sort(key=lambda c: c["score"], reverse=True)
+        logger.info(f"Retrieved {len(candidates)} distinct candidates.")
+        return candidates
