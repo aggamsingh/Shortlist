@@ -1,5 +1,7 @@
 import json
 import os
+import re
+import time
 
 from indexer.utils import get_logger
 
@@ -13,6 +15,11 @@ DEFAULT_MAX_CHARS_PER_CANDIDATE = 1200
 
 # Hard ceiling on candidates per LLM call, independent of RETRIEVAL_CANDIDATES.
 DEFAULT_MAX_CANDIDATES = 30
+
+# Backoff ceiling. Provider rate limits are usually enforced over a 60-second
+# tokens-per-minute window, so a cap below that can never actually clear one --
+# the retries burn out inside the same window and the request degrades anyway.
+MAX_RETRY_DELAY = 65.0
 
 
 def truncate_text(text: str, max_chars: int) -> str:
@@ -108,6 +115,9 @@ class CVReranker:
         self.max_candidates = max(
             1, int(os.getenv("MAX_CANDIDATES_PER_RERANK", DEFAULT_MAX_CANDIDATES))
         )
+        # Retries apply only to transient failures (rate limits, 5xx); a bad key
+        # or a retired model id fails immediately rather than sleeping first.
+        self.max_retries = max(0, int(os.getenv("LLM_MAX_RETRIES", "4")))
 
         if not self.is_configured:
             logger.warning(
@@ -264,18 +274,82 @@ class CVReranker:
 
         return self._merge(shortlist, rankings, top_k)
 
+    @staticmethod
+    def _retry_delay(error: Exception, attempt: int) -> float:
+        """Seconds to wait before retrying, or 0 if the error is not transient.
+
+        Rate limiting is the expected steady state on a metered API, not an
+        outage: a burst of screening requests will hit a tokens-per-minute cap
+        routinely. Providers usually say how long to wait, so that hint is
+        preferred over a blind backoff.
+        """
+        text = str(error).lower()
+        transient = (
+            "rate limit" in text
+            or "rate_limit" in text
+            or "429" in text
+            or "timeout" in text
+            or "503" in text
+            or "502" in text
+            or "overloaded" in text
+        )
+        if not transient:
+            return 0.0
+
+        # Providers state how long to wait. Honour it, but do not retry at all
+        # when the wait exceeds what a request can reasonably be held for: a
+        # per-minute cap clears in seconds, whereas an exhausted daily quota
+        # reports minutes or hours. Sleeping through a short backoff for a quota
+        # that resets in 16 minutes only delays the inevitable fallback.
+        hint = re.search(r"try again in (?:(\d+)m)?([0-9.]+)s", text)
+        if hint:
+            wait = float(hint.group(1) or 0) * 60 + float(hint.group(2))
+            if wait > MAX_RETRY_DELAY:
+                logger.info(
+                    f"Provider asked for a {wait:.0f}s wait (likely a daily quota), "
+                    f"beyond the {MAX_RETRY_DELAY:.0f}s ceiling; degrading immediately."
+                )
+                return 0.0
+            return min(wait + 0.5, MAX_RETRY_DELAY)
+
+        match = re.search(r"try again in ([0-9.]+)s", text)
+        if match:
+            try:
+                return min(float(match.group(1)) + 0.5, MAX_RETRY_DELAY)
+            except ValueError:
+                pass
+        return min(2.0 * (2 ** attempt), MAX_RETRY_DELAY)  # 2s, 4s, 8s, 16s ...
+
+    def _call_with_retry(self, call, jd: str, candidates: list[dict], label: str):
+        """Invoke one provider, retrying only on transient failures."""
+        last_error = None
+        for attempt in range(self.max_retries + 1):
+            try:
+                return call(jd, candidates)
+            except Exception as e:
+                last_error = e
+                delay = self._retry_delay(e, attempt) if attempt < self.max_retries else 0.0
+                if delay <= 0:
+                    raise
+                logger.warning(
+                    f"{label} rate-limited or unavailable "
+                    f"(attempt {attempt + 1}/{self.max_retries + 1}); retrying in {delay:.1f}s."
+                )
+                time.sleep(delay)
+        raise last_error
+
     def _call_provider(self, jd: str, candidates: list[dict]) -> list[dict]:
         """Try the preferred provider, then the other one if it is configured."""
         errors = []
         if self.gemini_key:
             try:
-                return self._rerank_with_gemini(jd, candidates)
+                return self._call_with_retry(self._rerank_with_gemini, jd, candidates, "Gemini")
             except Exception as e:
                 errors.append(f"Gemini: {e}")
                 logger.warning(f"Gemini reranking failed: {e}")
         if self.groq_key:
             try:
-                return self._rerank_with_groq(jd, candidates)
+                return self._call_with_retry(self._rerank_with_groq, jd, candidates, "Groq")
             except Exception as e:
                 errors.append(f"Groq: {e}")
                 logger.warning(f"Groq reranking failed: {e}")

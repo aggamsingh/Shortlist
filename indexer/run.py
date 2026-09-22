@@ -22,6 +22,7 @@ from indexer.parser import (
     COMMON_CITIES,
 )
 from indexer.embedder import CVEmbedder
+from indexer.sparse import BM25Encoder
 
 # Load environment variables
 load_dotenv()
@@ -38,6 +39,17 @@ STATE_FILE_PATH = os.getenv("STATE_FILE_PATH", "./data/index_state.json")
 # (no server, no Docker). Embedded mode holds an exclusive lock, so index first
 # and start the API afterwards.
 QDRANT_PATH = os.getenv("QDRANT_PATH")
+
+# Hybrid (dense + BM25) retrieval. Costs a full re-parse of the corpus on every
+# run, because BM25 needs corpus-wide statistics; set false to skip that and
+# fall back to dense-only indexing.
+HYBRID_RETRIEVAL = os.getenv("HYBRID_RETRIEVAL", "true").strip().lower() not in ("0", "false", "no")
+BM25_STATE_PATH = os.getenv("BM25_STATE_PATH", "./data/bm25_state.json")
+
+# The dense vector stays unnamed ("") so existing dense-only queries and any
+# previously written points keep working; sparse is added as a named vector.
+DENSE_VECTOR_NAME = ""
+SPARSE_VECTOR_NAME = "text"
 
 def word_boundary(term: str) -> str:
     """Regex matching `term` as a whole word."""
@@ -136,7 +148,8 @@ def main():
                 vectors_config=models.VectorParams(
                     size=vector_dim,
                     distance=models.Distance.COSINE
-                )
+                ),
+                sparse_vectors_config={SPARSE_VECTOR_NAME: models.SparseVectorParams()},
             )
             logger.info(f"Collection '{QDRANT_COLLECTION}' created successfully.")
         else:
@@ -166,10 +179,14 @@ def main():
 
     logger.info(f"Found {len(cv_files)} candidate CV files to check.")
 
-    updated_files_count = 0
-    skipped_files_count = 0
-
-    # 6. Index each file
+    # 6. Pass one: parse and chunk everything.
+    #
+    # BM25 needs corpus-wide statistics (document frequency, average length), so
+    # every CV has to be read even when only one has changed. Parsing is cheap
+    # next to embedding -- the expensive step still runs only for changed files
+    # in pass two. With HYBRID_RETRIEVAL off, unchanged files are skipped here
+    # entirely and this becomes the original single-pass behaviour.
+    parsed = {}
     for file_path in cv_files:
         filename = os.path.basename(file_path)
         try:
@@ -178,15 +195,11 @@ def main():
             logger.error(f"Could not calculate hash for {filename}, skipping.")
             continue
 
-        # Check if file has changed
-        if file_path in state and state[file_path].get("hash") == file_hash:
+        unchanged = file_path in state and state[file_path].get("hash") == file_hash
+        if unchanged and not HYBRID_RETRIEVAL:
             logger.debug(f"Skipping {filename} - hash unchanged.")
-            skipped_files_count += 1
             continue
 
-        logger.info(f"Indexing new or modified file: {filename}")
-        
-        # Parse CV text
         try:
             cv_text = parse_cv(file_path)
         except Exception as e:
@@ -197,30 +210,70 @@ def main():
             logger.warning(f"Parsed CV text is empty for {filename}, skipping.")
             continue
 
-        # Extract metadata
-        candidate_name = clean_candidate_name(filename)
-        years_exp = extract_years_of_experience(cv_text)
-        location = extract_location(cv_text)
-        
-        # Generate deterministic UUIDs for candidate
-        # Using filename and relative path helps keep candidate ID unique and persistent
         relative_path = os.path.relpath(file_path, CV_FOLDER_PATH)
-        candidate_uuid = uuid.uuid5(uuid.NAMESPACE_DNS, relative_path)
-        
-        logger.info(f"Candidate: '{candidate_name}' | ID: {candidate_uuid} | Exp: {years_exp} yrs | Loc: {location}")
+        parsed[file_path] = {
+            "hash": file_hash,
+            "unchanged": unchanged,
+            "name": clean_candidate_name(filename),
+            "years": extract_years_of_experience(cv_text),
+            "location": extract_location(cv_text),
+            "candidate_uuid": uuid.uuid5(uuid.NAMESPACE_DNS, relative_path),
+            "chunks": chunk_cv(cv_text),
+        }
 
-        # Chunk CV text
-        chunks = chunk_cv(cv_text)
-        logger.info(f"Generated {len(chunks)} text chunks for {candidate_name}.")
+    # 7. Fit BM25 across every chunk in the corpus.
+    encoder = BM25Encoder()
+    if HYBRID_RETRIEVAL and parsed:
+        encoder.fit(chunk for doc in parsed.values() for chunk in doc["chunks"])
 
-        # Generate Embeddings
+    def sparse_vector(text: str):
+        indices, values = encoder.encode_document(text)
+        return models.SparseVector(indices=indices, values=values)
+
+    # 8. Pass two: embed and upsert changed files; refresh sparse vectors on the rest.
+    updated_files_count = 0
+    refreshed_files_count = 0
+    skipped_files_count = 0
+
+    for file_path, doc in parsed.items():
+        candidate_uuid = doc["candidate_uuid"]
+        chunks = doc["chunks"]
+        point_ids = [str(uuid.uuid5(candidate_uuid, f"chunk_{i}")) for i in range(len(chunks))]
+
+        if doc["unchanged"]:
+            # Document weights depend on average corpus length, which shifts as
+            # CVs are added. Refreshing the sparse side keeps BM25 consistent
+            # without paying to re-embed; update_vectors leaves the dense vector
+            # untouched.
+            if HYBRID_RETRIEVAL:
+                try:
+                    qdrant_client.update_vectors(
+                        collection_name=QDRANT_COLLECTION,
+                        points=[
+                            models.PointVectors(id=pid, vector={SPARSE_VECTOR_NAME: sparse_vector(chunk)})
+                            for pid, chunk in zip(point_ids, chunks)
+                        ],
+                    )
+                    refreshed_files_count += 1
+                except Exception as e:
+                    logger.warning(f"Could not refresh sparse vectors for {doc['name']}: {e}")
+            skipped_files_count += 1
+            continue
+
+        logger.info(f"Indexing new or modified file: {os.path.basename(file_path)}")
+        logger.info(
+            f"Candidate: '{doc['name']}' | ID: {candidate_uuid} | "
+            f"Exp: {doc['years']} yrs | Loc: {doc['location']}"
+        )
+        logger.info(f"Generated {len(chunks)} text chunks for {doc['name']}.")
+
         try:
             embeddings = embedder.embed_texts(chunks)
         except Exception as e:
-            logger.error(f"Failed to embed chunks for {candidate_name}: {e}. Skipping upsert.")
+            logger.error(f"Failed to embed chunks for {doc['name']}: {e}. Skipping upsert.")
             continue
 
-        # 7. Delete stale vectors for this candidate before inserting new ones
+        # Clear stale vectors for this candidate before inserting new ones.
         try:
             qdrant_client.delete(
                 collection_name=QDRANT_COLLECTION,
@@ -234,50 +287,53 @@ def main():
                 )
             )
         except Exception as e:
-            logger.error(f"Failed to clear old vectors for {candidate_name}: {e}")
+            logger.error(f"Failed to clear old vectors for {doc['name']}: {e}")
 
-        # 8. Compile Qdrant Points and Upsert
         points = []
-        for i, (chunk, vector) in enumerate(zip(chunks, embeddings)):
-            point_id = str(uuid.uuid5(candidate_uuid, f"chunk_{i}"))
+        for point_id, chunk, dense in zip(point_ids, chunks, embeddings):
+            vector = {DENSE_VECTOR_NAME: dense}
+            if HYBRID_RETRIEVAL:
+                vector[SPARSE_VECTOR_NAME] = sparse_vector(chunk)
             points.append(
                 models.PointStruct(
                     id=point_id,
                     vector=vector,
                     payload={
                         "candidate_id": str(candidate_uuid),
-                        "name": candidate_name,
+                        "name": doc["name"],
                         # Normalise separators: os.path.join on Windows yields
                         # mixed "C:/a/b\c.docx", which looks broken in JSON.
                         "cv_path": file_path.replace(os.sep, "/"),
                         "chunk_text": chunk,
-                        "years_of_experience": years_exp,
-                        "location": location
-                    }
+                        "years_of_experience": doc["years"],
+                        "location": doc["location"],
+                    },
                 )
             )
 
-        # Batch upsert points
         try:
-            qdrant_client.upsert(
-                collection_name=QDRANT_COLLECTION,
-                points=points
-            )
-            # Update index state
+            qdrant_client.upsert(collection_name=QDRANT_COLLECTION, points=points)
             state[file_path] = {
-                "hash": file_hash,
+                "hash": doc["hash"],
                 "indexed_at": datetime.now(timezone.utc).isoformat(timespec="seconds").replace("+00:00", "Z"),
-                "candidate_name": candidate_name,
-                "candidate_id": str(candidate_uuid)
+                "candidate_name": doc["name"],
+                "candidate_id": str(candidate_uuid),
             }
             updated_files_count += 1
-            logger.info(f"Successfully indexed candidate {candidate_name}")
+            logger.info(f"Successfully indexed candidate {doc['name']}")
         except Exception as e:
-            logger.error(f"Failed to upsert points to Qdrant for {candidate_name}: {e}")
+            logger.error(f"Failed to upsert points to Qdrant for {doc['name']}: {e}")
 
-    # 9. Save State File
+    # 9. Persist state. The BM25 statistics live next to the index because the
+    # API needs the identical IDF values to encode queries.
     save_index_state(STATE_FILE_PATH, state)
-    logger.info(f"Pipeline complete. Indexed: {updated_files_count} | Unchanged: {skipped_files_count}")
+    if HYBRID_RETRIEVAL and encoder.is_fitted:
+        encoder.save(BM25_STATE_PATH)
+
+    logger.info(
+        f"Pipeline complete. Indexed: {updated_files_count} | "
+        f"Unchanged: {skipped_files_count} (sparse refreshed: {refreshed_files_count})"
+    )
 
 if __name__ == "__main__":
     main()

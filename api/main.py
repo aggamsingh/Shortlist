@@ -149,7 +149,9 @@ async def screen_resumes(request: ScreenRequest):
         with stage_timer(timings, "retrieve_ms"):
             retrieved_candidates = retriever.search_candidates(
                 query_vector=jd_vector,
-                filters=request.filters
+                filters=request.filters,
+                # Raw JD text drives the BM25 branch of hybrid retrieval.
+                query_text=request.job_description,
             )
     except Exception as e:
         logger.error(f"Error during Qdrant candidate retrieval: {e}")
