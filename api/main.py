@@ -63,7 +63,7 @@ reranker = None
 async def lifespan(app: FastAPI):
     """Lifespan event handler to pre-load heavy embedding models and database clients."""
     global embedder, retriever, reranker
-    logger.info("Initializing Resume Screening microservice...")
+    logger.info("Initializing Shortlist microservice...")
     try:
         # Pre-load embedding model on CPU
         embedder = CVEmbedder()
@@ -76,10 +76,10 @@ async def lifespan(app: FastAPI):
         logger.critical(f"Failed to initialize core services on startup: {e}")
         raise e
     yield
-    logger.info("Shutting down Resume Screening microservice...")
+    logger.info("Shutting down Shortlist microservice...")
 
 app = FastAPI(
-    title="Resume Screener API",
+    title="Shortlist API",
     description="Microservice for screening resumes against Job Descriptions using RAG & Reranking.",
     version="1.0.0",
     lifespan=lifespan
