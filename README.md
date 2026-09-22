@@ -1,4 +1,6 @@
-# Resume Screener
+# Shortlist
+
+> Two-stage resume screening: vector retrieval + LLM reranking, with a labelled evaluation harness (nDCG, recall@k, MRR).
 
 A CPU-only microservice that takes a job description and returns the best-matching candidates from a corpus of CVs, each with a relevance score and a one-line justification.
 

@@ -220,7 +220,7 @@ def main() -> None:
     args = parser.parse_args()
 
     stats = corpus_stats()
-    print("Resume Screener - retrieval evaluation")
+    print("Shortlist - retrieval evaluation")
     print(
         f"corpus: {stats['candidates']} CVs, {stats['queries']} job descriptions, "
         f"{stats['distractors']} never-relevant distractors"
