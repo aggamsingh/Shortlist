@@ -234,8 +234,13 @@ def main() -> None:
 
         reranker = None
         if args.rerank:
+            # .env is loaded here, not at import, so the harness picks up keys
+            # without mutating os.environ for anything that merely imports it.
+            from dotenv import load_dotenv
+
             from api.reranker import CVReranker
 
+            load_dotenv(dotenv_path=".env")
             reranker = CVReranker()
             if not reranker.is_configured:
                 print("!! --rerank requested but no LLM key configured; skipping rerank.\n")

@@ -8,9 +8,7 @@ may corrupt a response or crash a request.
 
 import os
 import unittest
-
-os.environ.pop("GEMINI_API_KEY", None)
-os.environ.pop("GROQ_API_KEY", None)
+from unittest.mock import patch
 
 from api.reranker import (  # noqa: E402
     CVReranker,
@@ -202,21 +200,34 @@ class MergeTest(unittest.TestCase):
 
 
 class RerankWithoutProviderTest(unittest.TestCase):
+    """Behaviour when no usable provider is configured.
+
+    These pin the environment explicitly rather than relying on the ambient
+    process env. A developer with a real key in .env would otherwise see these
+    fail, because anything that calls load_dotenv() earlier in the run leaks
+    that key into os.environ for every test that follows.
+    """
+
+    @staticmethod
+    def _no_keys(**overrides):
+        env = {"GEMINI_API_KEY": "", "GROQ_API_KEY": ""}
+        env.update(overrides)
+        return patch.dict(os.environ, env, clear=False)
+
     def test_unconfigured_reranker_degrades_instead_of_raising(self):
-        reranker = CVReranker()
-        self.assertFalse(reranker.is_configured)
-        out = reranker.rerank("some jd", make_candidates(), top_k=2)
+        with self._no_keys():
+            reranker = CVReranker()
+            self.assertFalse(reranker.is_configured)
+            out = reranker.rerank("some jd", make_candidates(), top_k=2)
         self.assertEqual([c["name"] for c in out], ["Alice", "Bob"])
 
     def test_empty_candidate_list(self):
-        self.assertEqual(CVReranker().rerank("jd", [], 5), [])
+        with self._no_keys():
+            self.assertEqual(CVReranker().rerank("jd", [], 5), [])
 
     def test_placeholder_keys_are_treated_as_unconfigured(self):
-        os.environ["GEMINI_API_KEY"] = "your_gemini_api_key_here"
-        try:
+        with self._no_keys(GEMINI_API_KEY="your_gemini_api_key_here"):
             self.assertFalse(CVReranker().is_configured)
-        finally:
-            os.environ.pop("GEMINI_API_KEY", None)
 
     def test_provider_failure_degrades_to_vector_order(self):
         """A provider outage must return ranked results, not a 500."""

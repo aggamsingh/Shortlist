@@ -16,9 +16,7 @@ import sys
 
 from dotenv import load_dotenv
 
-load_dotenv()
-
-from api.reranker import CVReranker  # noqa: E402
+from api.reranker import CVReranker
 
 # Deliberately unambiguous: a competent reranker must put c_vector first and
 # c_frontend last. If a provider cannot do this, the problem is the provider or
@@ -104,6 +102,11 @@ def check_provider(reranker: CVReranker, provider: str) -> bool:
 
 
 def main() -> int:
+    # Loaded here rather than at import: calling load_dotenv() as an import side
+    # effect injects real keys into os.environ for any process that merely
+    # imports this module, which silently broke tests asserting "no key set".
+    load_dotenv(dotenv_path=".env")
+
     reranker = CVReranker()
 
     print("LLM provider check")

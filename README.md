@@ -135,13 +135,69 @@ A quarter of the corpus is deliberate distractors: a QA engineer whose CV is den
 
 **Caveat, stated plainly:** 3 within-role queries over 32 synthetic CVs is a small sample. Differences of 0.03–0.04 nDCG are well inside the noise one query would produce, and these fixtures are short and uniformly structured, which flatters whole-CV embedding. These numbers justify the grouping change; they are *not* enough to retire section chunking. The honest next step is more queries and longer, messier CVs.
 
-### Reranker evaluation — not yet measured
+### Reranker evaluation — measured
 
-**Every number above is LLM-free.** The reranker has never been run against a real
-provider, because no API key was available during development. Rather than
-guess at a result, the reranker row is simply absent.
+Every number in the table above is LLM-free. Adding the reranker on top of
+`section + grouped` gives, over **5 runs** at `temperature=0`
+(Groq, `openai/gpt-oss-120b`):
 
-To fill it in, add a key to `.env` and verify it first:
+**Within-role queries — the discriminating set**
+
+| metric | retrieval only | + LLM rerank | change |
+|---|---|---|---|
+| recall@5 | 0.494 | 0.739 – 0.822 (mean 0.805) | **+0.31** |
+| precision@5 | 0.467 | 0.733 – 0.800 (mean 0.787) | **+0.32** |
+| nDCG@5 | 0.605 | 0.855 – 0.886 (mean 0.877) | **+0.27** |
+| MRR | 0.833 | 1.000 (all 5 runs) | +0.17 |
+| pool recall | 0.822 | 0.822 (unchanged) | — |
+
+**Cross-role queries**
+
+| metric | retrieval only | + LLM rerank | change |
+|---|---|---|---|
+| recall@5 | 0.830 | 0.763 (all 5 runs) | **−0.07** |
+| precision@5 | 0.560 | 0.520 (all 5 runs) | **−0.04** |
+| nDCG@5 | 0.799 | 0.887 – 0.899 (mean 0.895) | +0.10 |
+| MRR | 0.800 | 1.000 (all 5 runs) | +0.20 |
+
+**What this shows:**
+
+1. **Reranking is the single largest quality lever on the hard set** — +0.27 nDCG,
+   and MRR reaches a perfect 1.000 in every run, meaning the top result was
+   always relevant. The embedding model does see the discriminating requirement;
+   it just does not weight it heavily enough, and the LLM does.
+2. **Retrieval is now the bottleneck, not ranking.** Within-role recall@5 reaches
+   0.822 in 4 of 5 runs — exactly the pool recall. The reranker pulled *every*
+   relevant candidate retrieval handed it into the top 5. Further gains have to
+   come from retrieving better, not ranking better, which is precisely what the
+   grouped-retrieval change was for.
+3. **Cross-role recall and precision get worse.** This is a real trade-off, not a
+   bug. The reranker promotes strong (grade-2) matches and pushes partial
+   (grade-1) ones out of the top 5. Graded nDCG rewards that; binary recall@5
+   (which counts grade ≥ 1) penalises it. Both numbers are true — they measure
+   different things, and a system tuned for "shortlist the best" will look worse
+   on "find everyone plausible".
+4. **`temperature=0` is not fully deterministic.** Hosted inference still varies
+   run to run, which is why ranges over 5 runs are reported rather than a single
+   figure. Within-role nDCG moved ±0.03; cross-role recall and precision were
+   identical in all 5.
+
+**Measured latency** (3 live API requests, 3 candidates each):
+
+| stage | time |
+|---|---|
+| embed | 12 – 51 ms |
+| retrieve | 1.3 – 2.6 ms |
+| **rerank** | **1505 – 2113 ms** |
+| total | 1.5 – 2.2 s |
+
+The LLM call is ~97% of request time. Retrieval is effectively free; any latency
+work belongs at the reranking stage (batching, a smaller model, or reranking
+only the top slice of the shortlist).
+
+### Reproducing this
+
+Add a key to `.env` and verify it first:
 
 ```bash
 python -m evaluation.check_llm      # ONE real call; confirms key + model id work
@@ -161,16 +217,9 @@ Then:
 python -m evaluation.run_eval --ablations --rerank
 ```
 
-Reranking is where the within-role gap (nDCG 0.605) should close: the
-discriminating requirement is stated plainly in each JD and present in the
-resume text, and the embedding model simply does not weight it heavily enough.
-Whether that actually happens is an open question, and the README will say so
-until someone runs it.
-
-The rerank *plumbing* is covered by tests against a stubbed provider
-(`tests/test_eval_harness.py`), so the code path is known to work end to end —
-prompt construction, JSON parsing, score normalisation and merging. Only the
-network call itself is unexercised.
+Model ids get retired: the previous default, `llama-3.3-70b-versatile`, returned
+a 404 on a current Groq account. `check_llm` reports that distinctly from an
+invalid key, so you can tell the two apart immediately.
 
 ---
 
@@ -217,9 +266,10 @@ Known and deliberate, rather than hidden:
 - **Location filtering is exact-match on a guessed city.** No geocoding, no radius, no remote handling.
 - **The evaluation corpus is synthetic and small.** Real resumes cannot be committed to a public repo, but these fixtures are cleaner and more uniformly structured than real CVs, so the absolute numbers are optimistic. The *relative* comparisons between configurations are the useful part.
 - **No OCR.** Scanned image-only PDFs extract no text and are skipped with a warning.
-- **Reranker latency is untested at scale.** Measured stages so far: embedding 33–74 ms, retrieval ~2.4 ms. The LLM call will dominate and has not been measured.
+- **Reranker latency dominates and is not optimised.** Measured: embed 12–51 ms, retrieve 1.3–2.6 ms, rerank 1505–2113 ms — about 97% of request time, for only 3 candidates. It has not been measured with a full 30-candidate shortlist, and there is no batching, caching or timeout tuning.
 - **The Docker image build is unverified.** The Docker daemon was unavailable during development, so `docker compose up` has not been executed end-to-end. Everything else here was run for real.
-- **Model ids drift.** `gemini-2.5-flash` and `llama-3.3-70b-versatile` are the defaults and are configurable via `GEMINI_MODEL` / `GROQ_MODEL`. Verify they are current for your account.
+- **Model ids drift.** The Groq default is `openai/gpt-oss-120b`, verified working; the previous `llama-3.3-70b-versatile` now 404s. The Gemini default `gemini-2.5-flash` is **unverified** — no Gemini key was tested. Both are configurable via `GEMINI_MODEL` / `GROQ_MODEL`.
+- **Results are from one model on a small corpus.** The reranker numbers come from a single provider over 8 queries. They show the pipeline works; they are not a general claim about reranking.
 
 ## Next steps
 
