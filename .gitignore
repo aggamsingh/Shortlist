@@ -30,3 +30,6 @@ qdrant_storage/
 # Client CV Folder (Excludes actual resumes, preserves directory)
 cvs/*
 !cvs/.gitkeep
+
+# Local .env backups (may contain real keys)
+.env.backup*
