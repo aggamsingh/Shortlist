@@ -98,7 +98,7 @@ class CVReranker:
 
         # Model ids move fast and get retired; keep them configurable.
         self.gemini_model = os.getenv("GEMINI_MODEL", "gemini-2.5-flash")
-        self.groq_model = os.getenv("GROQ_MODEL", "llama-3.3-70b-versatile")
+        self.groq_model = os.getenv("GROQ_MODEL", "openai/gpt-oss-120b")
 
         # Floors stop a stray 0 in .env from silently disabling the caps, which
         # would put the unbounded prompt back in play.
@@ -193,7 +193,10 @@ class CVReranker:
         logger.info(f"Reranking {len(candidates)} candidates via Gemini ({self.gemini_model}).")
         response = model.generate_content(
             self._build_prompt(jd, candidates),
-            generation_config={"response_mime_type": "application/json"},
+            generation_config={
+                "response_mime_type": "application/json",
+                "temperature": 0,
+            },
         )
         return self._parse_rankings(response.text, "Gemini")
 
@@ -204,6 +207,9 @@ class CVReranker:
             model=self.groq_model,
             messages=[{"role": "user", "content": self._build_prompt(jd, candidates)}],
             response_format={"type": "json_object"},
+            # Ranking should be reproducible: the same shortlist and JD must give
+            # the same order twice, or the evaluation measures sampling noise.
+            temperature=0,
         )
         return self._parse_rankings(completion.choices[0].message.content, "Groq")
 
