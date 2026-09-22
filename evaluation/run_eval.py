@@ -25,8 +25,13 @@ from evaluation.corpus import CANDIDATES, HARD_QUERIES, QUERIES, corpus_stats, r
 from evaluation.metrics import aggregate, evaluate_query, recall_at_k
 from indexer.embedder import CVEmbedder
 from indexer.parser import chunk_by_words, chunk_cv, clean_text
+from indexer.sparse import BM25Encoder
 
 COLLECTION = "eval_resumes"
+SPARSE_VECTOR_NAME = "text"
+
+# Fitted in build_index and reused by the hybrid retriever below.
+_BM25 = BM25Encoder()
 
 
 # ---------------------------------------------------------------- chunkers
@@ -63,10 +68,17 @@ CHUNKERS = {
 }
 
 
+def _sparse(text: str) -> models.SparseVector:
+    """BM25 document vector for a chunk."""
+    indices, values = _BM25.encode_document(text)
+    return models.SparseVector(indices=indices, values=values)
+
+
 # ---------------------------------------------------------------- indexing
 
 def build_index(client: QdrantClient, embedder: CVEmbedder, chunker) -> int:
     """(Re)build the eval collection using the given chunking strategy."""
+    global _BM25
     if client.collection_exists(COLLECTION):
         client.delete_collection(COLLECTION)
     client.create_collection(
@@ -74,12 +86,18 @@ def build_index(client: QdrantClient, embedder: CVEmbedder, chunker) -> int:
         vectors_config=models.VectorParams(
             size=embedder.dimension, distance=models.Distance.COSINE
         ),
+        sparse_vectors_config={SPARSE_VECTOR_NAME: models.SparseVectorParams()},
     )
+
+    # BM25 is refitted per chunking strategy: document frequency and average
+    # length both depend on how the corpus was split.
+    chunked = {c["id"]: chunker(render_cv(c)) for c in CANDIDATES}
+    _BM25 = BM25Encoder().fit(ch for chunks in chunked.values() for ch in chunks)
 
     points, total_chunks = [], 0
     for candidate in CANDIDATES:
         text = render_cv(candidate)
-        chunks = chunker(text)
+        chunks = chunked[candidate["id"]]
         total_chunks += len(chunks)
         vectors = embedder.embed_texts(chunks)
         for i, (chunk, vector) in enumerate(zip(chunks, vectors)):
@@ -87,7 +105,10 @@ def build_index(client: QdrantClient, embedder: CVEmbedder, chunker) -> int:
                 models.PointStruct(
                     # Deterministic ids keep reruns comparable.
                     id=str(uuid.uuid5(uuid.NAMESPACE_DNS, f"{candidate['id']}-{i}")),
-                    vector=vector,
+                    vector={
+                        "": vector,
+                        SPARSE_VECTOR_NAME: _sparse(chunk),
+                    },
                     payload={
                         "candidate_id": candidate["id"],
                         "name": candidate["name"],
@@ -140,7 +161,43 @@ def retrieve_flat(client, vector, budget: int) -> list:
     return ranked
 
 
-RETRIEVERS = {"grouped": retrieve_grouped, "flat": retrieve_flat}
+def retrieve_hybrid(client, vector, budget: int, query_text: str = None):
+    """Dense + BM25, fused with Reciprocal Rank Fusion, grouped by candidate.
+
+    Dense embeddings are weak on exact low-frequency technical tokens (Qdrant,
+    asyncio, Terraform), which is what the within-role queries turn on. BM25 is
+    strong there and weak at paraphrase, so the two are complementary.
+    """
+    indices, values = _BM25.encode_query(query_text or "")
+    if not indices:
+        return retrieve_grouped(client, vector, budget)
+
+    prefetch_limit = max(budget * 3, 100)
+    response = client.query_points_groups(
+        collection_name=COLLECTION,
+        prefetch=[
+            models.Prefetch(query=vector, limit=prefetch_limit),
+            models.Prefetch(
+                query=models.SparseVector(indices=indices, values=values),
+                using=SPARSE_VECTOR_NAME, limit=prefetch_limit,
+            ),
+        ],
+        query=models.FusionQuery(fusion=models.Fusion.RRF),
+        group_by="candidate_id", limit=budget, group_size=3, with_payload=True,
+    )
+    ranked = []
+    for group in response.groups:
+        best = max(group.hits, key=lambda h: h.score)
+        ranked.append((best.payload["candidate_id"], best.score))
+    ranked.sort(key=lambda x: -x[1])
+    return ranked
+
+
+RETRIEVERS = {
+    "grouped": retrieve_grouped,
+    "flat": retrieve_flat,
+    "hybrid": retrieve_hybrid,
+}
 
 
 # ---------------------------------------------------------------- evaluation
@@ -154,7 +211,10 @@ def evaluate_config(client, embedder, retriever_name: str, budget: int, k: int,
 
     for query in queries:
         vector = embedder.embed_text(query["job_description"])
-        ranked = retrieve(client, vector, budget)
+        if retriever_name == "hybrid":
+            ranked = retrieve(client, vector, budget, query["job_description"])
+        else:
+            ranked = retrieve(client, vector, budget)
         distinct_counts.append(len(ranked))
         ranked_ids = [cid for cid, _ in ranked]
         pool_ids = list(ranked_ids)  # the set handed to the reranker
@@ -258,10 +318,10 @@ def main() -> None:
                 print(title)
                 print(header(args.k))
                 metrics = evaluate_config(
-                    client, embedder, "grouped", args.budget, args.k, reranker,
+                    client, embedder, "hybrid", args.budget, args.k, reranker,
                     queries=queries,
                 )
-                label = "section + grouped" + (" + rerank" if reranker else "")
+                label = "section + hybrid" + (" + rerank" if reranker else "")
                 print(format_row(label, metrics, args.k))
                 print()
         else:
@@ -270,7 +330,7 @@ def main() -> None:
                 print(header(args.k))
                 for chunker_name in ("whole", "window", "window60", "section"):
                     n_chunks = build_index(client, embedder, CHUNKERS[chunker_name])
-                    for retriever_name in ("flat", "grouped"):
+                    for retriever_name in ("flat", "grouped", "hybrid"):
                         metrics = evaluate_config(
                             client, embedder, retriever_name, args.budget, args.k,
                             queries=queries,
@@ -285,10 +345,10 @@ def main() -> None:
                 if reranker:
                     build_index(client, embedder, CHUNKERS["section"])
                     metrics = evaluate_config(
-                        client, embedder, "grouped", args.budget, args.k, reranker,
+                        client, embedder, "hybrid", args.budget, args.k, reranker,
                         queries=queries,
                     )
-                    print(format_row("section  + grouped  + LLM rerank", metrics, args.k))
+                    print(format_row("section  + hybrid   + LLM rerank", metrics, args.k))
                 print()
 
         print("cands = mean distinct candidates reaching the reranker (higher is better)")

@@ -79,6 +79,34 @@ A naive top-N chunk search returns *chunks*, and one verbose CV can occupy many 
 
 Qdrant's `query_points_groups` groups hits by `candidate_id`, guaranteeing N **distinct** candidates while still surfacing each one's best-matching chunks. On the within-role query set, this raises the share of relevant candidates that reach the reranker from **0.617 to 0.822** at the same retrieval budget. That number is the ceiling on final quality: a reranker can reorder what it is given, but it can never recover a candidate retrieval dropped.
 
+### Retrieval is hybrid: dense embeddings fused with BM25
+
+The evaluation pointed here. Once reranking was measured, within-role recall@5
+reached the pool recall exactly — the reranker was already promoting *every*
+relevant candidate it received, so the remaining loss was entirely candidates
+retrieval never surfaced. Pool recall of 0.822 meant ~18% were missing before
+ranking even began.
+
+Embeddings are weak on exact, low-frequency technical tokens — "Qdrant",
+"Pinecone", "asyncio", "Terraform" — which is precisely what the within-role
+queries turn on. BM25 is strong there and weak at paraphrase, so the two are
+complementary. Both branches are queried and fused with Qdrant's native
+Reciprocal Rank Fusion, still grouped by candidate.
+
+Measured effect on the within-role set: **pool recall 0.822 → 0.933**, and
+nDCG@5 0.566 → 0.702 on whole-CV chunking. A regression test asserts the sparse
+branch still surfaces an exact term match that dense search ranks last.
+
+Document weights carry term-frequency saturation and query weights carry IDF, so
+their dot product is the BM25 score. Token ids come from CRC32 rather than a
+stored vocabulary — Python's `hash()` is salted per process and would silently
+produce a different index on every run.
+
+The cost is honest: BM25 needs corpus-wide statistics, so the indexer re-parses
+every CV on each run. Parsing is cheap next to embedding, which still runs only
+for changed files, and unchanged CVs get their sparse vectors refreshed in place
+without re-embedding. `HYBRID_RETRIEVAL=false` restores the dense-only path.
+
 ### The reranker is treated as an untrusted input
 
 LLM output is the least reliable input in the system, so `api/reranker.py` assumes it will be malformed:
@@ -88,6 +116,7 @@ LLM output is the least reliable input in the system, so `api/reranker.py` assum
 - **Reranked candidates are ordered ahead of fallbacks.** An LLM score and a cosine similarity are different units, so interleaving them by raw value would let an unjudged `0.6` cosine outrank a judged `0.55`.
 - **A provider outage degrades, it does not 500.** With no key or a failed call, the service returns vector-similarity ordering and says so in `match_reasoning`.
 - **Prompt size is capped** per candidate and per request, because concatenated chunks are otherwise unbounded input to a metered API.
+- **Rate limits are retried; quotas are not.** A per-minute cap clears in seconds, so it is worth waiting out with backoff. An exhausted daily quota reports a wait of minutes to hours, and sleeping through a short backoff for that only delays the inevitable fallback — so when a provider asks for longer than the retry ceiling, the request degrades immediately. A retired model id or a bad key never retries at all.
 
 ### Readiness is handled in the application, not by a compose healthcheck
 
@@ -121,19 +150,24 @@ A quarter of the corpus is deliberate distractors: a QA engineer whose CV is den
 | **Cross-role** | | | | |
 | whole CV + flat | 0.870 | 0.920 | 0.960 | 10.0 |
 | section + flat | 0.830 | 0.799 | 0.870 | 5.6 |
-| section + grouped | 0.830 | 0.799 | **0.960** | **10.0** |
+| section + grouped | 0.830 | 0.799 | 0.960 | 10.0 |
+| section + **hybrid** | 0.830 | **0.851** | 0.920 | 10.0 |
+| window60 + **hybrid** | **0.870** | **0.916** | 0.920 | 10.0 |
 | **Within-role** | | | | |
 | whole CV + flat | 0.428 | 0.566 | 0.550 | 6.0 |
-| whole CV + grouped | 0.428 | 0.566 | **0.822** | **10.0** |
-| window60 + grouped | **0.467** | **0.639** | **0.878** | 10.0 |
+| whole CV + grouped | 0.428 | 0.566 | 0.822 | 10.0 |
+| whole CV + **hybrid** | 0.606 | 0.702 | **0.933** | 10.0 |
 | section + flat | 0.494 | 0.605 | 0.617 | 7.7 |
-| section + grouped | **0.494** | 0.605 | 0.822 | 10.0 |
+| section + grouped | 0.494 | 0.605 | 0.822 | 10.0 |
+| section + **hybrid** | 0.550 | 0.648 | 0.811 | 10.0 |
+| window60 + grouped | 0.467 | 0.639 | 0.878 | 10.0 |
+| window60 + **hybrid** | **0.728** | **0.785** | **0.933** | 10.0 |
 
 **What this actually shows:**
 
-1. **Grouping is the clear win.** It never hurts ranking and consistently raises pool recall — 0.617 → 0.822 for section chunking, 0.550 → 0.822 for whole-CV. Flat retrieval was silently discarding a third of the relevant candidates before the reranker ever saw them.
+1. **Grouping and hybrid both attack the same bottleneck, and both work.** Grouping raised pool recall from 0.617 → 0.822 (section) and 0.550 → 0.822 (whole CV); adding BM25 took it to **0.933**. Flat dense retrieval was silently discarding a third of the relevant candidates before the reranker ever saw them.
 2. **The cross-role set is nearly useless as a benchmark.** It sits at 0.92 nDCG for almost every configuration. Reporting only these numbers would make the system look better than it is.
-3. **Section chunking does not clearly earn its complexity.** It wins on within-role recall (0.494 vs 0.428) but *loses* on cross-role nDCG (0.799 vs 0.920), and a plain 60-word window beats it on within-role nDCG (0.639 vs 0.605). On this corpus the evidence does not support the fancier strategy.
+3. **Section chunking does not earn its complexity, and hybrid makes that clearer.** The best configuration on both query sets is a plain 60-word window with hybrid retrieval — within-role nDCG 0.785 against 0.648 for section, and cross-role 0.916 against 0.851. Section chunking now loses on every axis measured. It remains the shipped default only because these fixtures are ~110-word synthetic CVs whose sections are tiny; real resumes are longer and more structured, which is the case section chunking is designed for. Settling this needs a better corpus, not more opinion — which is why expanding it is the top open item.
 
 **Caveat, stated plainly:** 3 within-role queries over 32 synthetic CVs is a small sample. Differences of 0.03–0.04 nDCG are well inside the noise one query would produce, and these fixtures are short and uniformly structured, which flatters whole-CV embedding. These numbers justify the grouping change; they are *not* enough to retire section chunking. The honest next step is more queries and longer, messier CVs.
 
@@ -142,6 +176,9 @@ A quarter of the corpus is deliberate distractors: a QA engineer whose CV is den
 Every number in the table above is LLM-free. Adding the reranker on top of
 `section + grouped` gives, over **5 runs** at `temperature=0`
 (Groq, `openai/gpt-oss-120b`):
+
+These figures were taken with `section + grouped` retrieval, before hybrid
+search was added.
 
 **Within-role queries — the discriminating set**
 
@@ -183,6 +220,15 @@ Every number in the table above is LLM-free. Adding the reranker on top of
    run to run, which is why ranges over 5 runs are reported rather than a single
    figure. Within-role nDCG moved ±0.03; cross-role recall and precision were
    identical in all 5.
+
+**With hybrid retrieval underneath, one clean run** measured within-role
+nDCG@5 **0.921** and cross-role **0.881** — consistent with hybrid raising the
+retrieval ceiling the reranker works against.
+
+Only one run: the Groq free tier's daily token quota (200,000) was exhausted
+part-way through repeating it, and every subsequent run degraded to vector
+fallback. Degraded runs are not reported as results. Treat 0.921 as a single
+observation, not a range, until it is repeated on a fresh quota.
 
 **Measured latency** (3 live API requests, 3 candidates each):
 
@@ -277,7 +323,7 @@ Known and deliberate, rather than hidden:
 
 In rough priority order:
 
-1. Run the reranker evaluation with a real key and record the delta — this is the single biggest open question about the system.
-2. Expand the corpus with longer, messier CVs and more within-role queries, then revisit whether section chunking earns its place.
+1. Expand the corpus with longer, messier CVs and more within-role queries. Two separate findings now hinge on it: whether section chunking earns its place (current evidence says no), and whether differences of 0.03–0.04 nDCG mean anything at 8 queries.
+2. Repeat the hybrid + reranker measurement on a fresh token quota, so it is a range rather than a single run.
 3. Add the LLM metadata-extraction fallback for CVs where the regex finds nothing.
-4. Hybrid retrieval — combine vector similarity with BM25 keyword matching, which typically helps on exact technology names.
+4. Verify the Docker image build; the daemon was never available during development.

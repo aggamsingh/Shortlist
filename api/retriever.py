@@ -6,8 +6,12 @@ from qdrant_client.http import models
 from api.models import ScreeningFilters
 from indexer.utils import connect_qdrant, get_logger
 from indexer.parser import normalize_location
+from indexer.sparse import BM25Encoder
 
 logger = get_logger("api.retriever")
+
+# Must match the name the indexer writes; see indexer/run.py.
+SPARSE_VECTOR_NAME = "text"
 
 
 class CVRetriever:
@@ -34,6 +38,17 @@ class CVRetriever:
         )
         # Best-matching chunks kept per candidate to build its summary.
         self.chunks_per_candidate = int(os.getenv("CHUNKS_PER_CANDIDATE", "3"))
+
+        # BM25 statistics are produced by the indexer. If the file is absent --
+        # an older index, or HYBRID_RETRIEVAL disabled -- the encoder stays
+        # unfitted and retrieval quietly falls back to dense-only.
+        self.hybrid_enabled = os.getenv("HYBRID_RETRIEVAL", "true").strip().lower() not in ("0", "false", "no")
+        self.bm25 = BM25Encoder.load(os.getenv("BM25_STATE_PATH", "./data/bm25_state.json"))
+        if self.hybrid_enabled and not self.bm25.is_fitted:
+            logger.warning(
+                "Hybrid retrieval requested but no BM25 state found; using dense-only "
+                "search. Re-run the indexer to enable it."
+            )
 
         # QDRANT_PATH runs Qdrant embedded from a local directory, so the whole
         # service works with no server and no Docker. Embedded mode takes an
@@ -76,32 +91,78 @@ class CVRetriever:
                 )
         return models.Filter(must=conditions) if conditions else None
 
+    def _sparse_query(self, query_text: str):
+        """Build the BM25 query vector, or None when hybrid search is unavailable."""
+        if not (self.hybrid_enabled and self.bm25.is_fitted and query_text):
+            return None
+        indices, values = self.bm25.encode_query(query_text)
+        if not indices:
+            # No query term appears anywhere in the corpus, so the sparse branch
+            # would contribute nothing but would still cost a query.
+            return None
+        return models.SparseVector(indices=indices, values=values)
+
     def search_candidates(
         self,
         query_vector: list[float],
         filters: ScreeningFilters,
         top_n: int = None,
+        query_text: str = None,
     ) -> list[dict]:
-        """Return up to ``top_n`` distinct candidates ranked by best chunk score."""
+        """Return up to ``top_n`` distinct candidates ranked by best chunk score.
+
+        When BM25 statistics are available and ``query_text`` is supplied, dense
+        and sparse results are fused with Reciprocal Rank Fusion. Otherwise this
+        is a plain dense search, so a missing BM25 state degrades quality rather
+        than failing the request.
+        """
         if top_n is None:
             top_n = self.retrieval_candidates
 
         query_filter = self._build_filter(filters)
+        sparse_query = self._sparse_query(query_text)
 
         try:
-            logger.info(
-                f"Searching '{self.collection_name}' for {top_n} distinct candidates "
-                f"({self.chunks_per_candidate} chunks each)..."
-            )
-            response = self.client.query_points_groups(
-                collection_name=self.collection_name,
-                query=query_vector,
-                group_by="candidate_id",
-                limit=top_n,
-                group_size=self.chunks_per_candidate,
-                query_filter=query_filter,
-                with_payload=True,
-            )
+            if sparse_query is not None:
+                logger.info(
+                    f"Hybrid search on '{self.collection_name}' for {top_n} distinct "
+                    f"candidates (dense + BM25, RRF fused)..."
+                )
+                # Each branch is over-fetched relative to top_n: fusion can only
+                # rank what the branches returned, so a candidate that is strong
+                # on one signal alone still needs to survive its own prefetch.
+                prefetch_limit = max(top_n * self.chunks_per_candidate, 100)
+                response = self.client.query_points_groups(
+                    collection_name=self.collection_name,
+                    prefetch=[
+                        models.Prefetch(
+                            query=query_vector, limit=prefetch_limit, filter=query_filter
+                        ),
+                        models.Prefetch(
+                            query=sparse_query, using=SPARSE_VECTOR_NAME,
+                            limit=prefetch_limit, filter=query_filter,
+                        ),
+                    ],
+                    query=models.FusionQuery(fusion=models.Fusion.RRF),
+                    group_by="candidate_id",
+                    limit=top_n,
+                    group_size=self.chunks_per_candidate,
+                    with_payload=True,
+                )
+            else:
+                logger.info(
+                    f"Dense search on '{self.collection_name}' for {top_n} distinct "
+                    f"candidates ({self.chunks_per_candidate} chunks each)..."
+                )
+                response = self.client.query_points_groups(
+                    collection_name=self.collection_name,
+                    query=query_vector,
+                    group_by="candidate_id",
+                    limit=top_n,
+                    group_size=self.chunks_per_candidate,
+                    query_filter=query_filter,
+                    with_payload=True,
+                )
         except Exception as e:
             logger.error(f"Error querying Qdrant: {e}")
             raise
@@ -131,7 +192,11 @@ class CVRetriever:
                     "cv_path": payload.get("cv_path", ""),
                     "years_of_experience": payload.get("years_of_experience", 0),
                     "location": payload.get("location", "Unknown"),
-                    "score": best.score,
+                    # Clamped because this value can reach the API response
+                    # directly when the reranker is unavailable, and the schema
+                    # requires 0-1. Cosine is already bounded, but RRF fusion
+                    # scores are a different quantity with no such guarantee.
+                    "score": max(0.0, min(1.0, float(best.score))),
                     "resume_summary": "\n---\n".join(chunk_texts),
                 }
             )
