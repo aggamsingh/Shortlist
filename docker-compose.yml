@@ -31,6 +31,11 @@ services:
     environment:
       - QDRANT_HOST=qdrant
       - QDRANT_PORT=6333
+      # Explicitly cleared. QDRANT_PATH in .env selects embedded Qdrant for local
+      # development, and env_file loads it here too -- which silently overrode
+      # QDRANT_HOST, so containers ran their own embedded database instead of the
+      # qdrant service, and then contended for the same file lock.
+      - QDRANT_PATH=
     volumes:
       - ${CV_FOLDER_PATH:-./cvs}:/app/cvs
       - ./data:/app/data
@@ -55,6 +60,11 @@ services:
     environment:
       - QDRANT_HOST=qdrant
       - QDRANT_PORT=6333
+      # Explicitly cleared. QDRANT_PATH in .env selects embedded Qdrant for local
+      # development, and env_file loads it here too -- which silently overrode
+      # QDRANT_HOST, so containers ran their own embedded database instead of the
+      # qdrant service, and then contended for the same file lock.
+      - QDRANT_PATH=
     volumes:
       - ${CV_FOLDER_PATH:-./cvs}:/app/cvs
       - ./data:/app/data

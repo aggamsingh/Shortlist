@@ -16,6 +16,7 @@ from pathlib import Path
 
 from docx import Document
 from qdrant_client import QdrantClient
+from qdrant_client.http import models
 
 import indexer.run as run
 from api.models import ScreeningFilters
@@ -128,6 +129,39 @@ class PipelineEndToEndTest(unittest.TestCase):
             collection_name=run.QDRANT_COLLECTION, limit=200, with_payload=False
         )
         self.assertEqual(len(before), len(after), "re-running duplicated vectors")
+
+    def test_empty_collection_forces_a_full_reindex(self):
+        """State file and database can diverge; an empty index must self-heal.
+
+        The state file records what was indexed, the database holds it, and the
+        two drift apart: switching between embedded and server Qdrant, wiping a
+        volume while ./data survives, restoring a backup, changing the collection
+        name. Every file then looks unchanged, nothing is written, and the run
+        reports success over an empty index.
+
+        Found by running docker compose for the first time: the indexer skipped
+        all three CVs and left the fresh Qdrant server with zero points.
+        """
+        # Divergence is simulated by pointing at a different collection while
+        # keeping the state file, which is one of the real ways it happens.
+        # Deleting and recreating the collection would be the more direct
+        # simulation, but delete_collection does not actually purge points in
+        # embedded Qdrant -- the same quirk that corrupted the evaluation
+        # harness, verified again here.
+        original_collection = run.QDRANT_COLLECTION
+        run.QDRANT_COLLECTION = "e2e_diverged"
+        try:
+            # The state file still claims every file is indexed.
+            self.assertTrue(self.state_path.exists())
+
+            run.main()
+
+            points = self.client.count(
+                collection_name=run.QDRANT_COLLECTION, exact=True
+            ).count
+            self.assertGreater(points, 0, "empty collection was not re-indexed")
+        finally:
+            run.QDRANT_COLLECTION = original_collection
 
     def test_modified_file_is_reindexed_without_stale_vectors(self):
         """Editing a CV replaces its vectors rather than accumulating them."""

@@ -56,7 +56,7 @@ project. See [Reranker evaluation](#reranker-evaluation).
 - [How it works](#how-it-works) — the pipeline, stage by stage
 - [Design decisions](#design-decisions) — what was chosen and what it cost
 - [Evaluation](#evaluation) — the benchmark, the results, and the bug in it
-- [Testing](#testing) — 182 tests and why the original 32 were worthless
+- [Testing](#testing) — 183 tests and why the original 32 were worthless
 - [Configuration](#configuration) — every environment variable
 - [Limitations](#limitations) — what this does not do, stated plainly
 - [Next steps](#next-steps)
@@ -89,9 +89,27 @@ Embedded Qdrant takes an **exclusive file lock**, so the indexer and the API can
 ### With Docker
 
 ```bash
-docker compose up -d          # Qdrant + API
-docker compose run indexer    # index whatever is in CV_FOLDER_PATH
+docker compose up -d              # Qdrant server + API
+docker compose run --rm indexer   # index whatever is in CV_FOLDER_PATH
 ```
+
+Verified end to end: image builds, `torch 2.14.0+cpu` (the CPU wheel, ~2.26 GB
+image — the `--index-url` pin works and no CUDA payload is pulled), Qdrant server
+and API containers come up healthy, indexing and screening both run, and the API
+reports `llm_configured: true` with live reranking.
+
+Two things this surfaced that local runs never could:
+
+- **`QDRANT_PATH` in `.env` silently overrode `QDRANT_HOST`.** `env_file` loads it
+  into the containers, so both ran their own embedded database instead of the
+  `qdrant` service — and then contended for the same file lock. Compose now
+  clears it explicitly.
+- **The state file and the database can diverge.** `./data` is bind-mounted and
+  survives `docker compose down -v`, so `index_state.json` claimed three CVs were
+  indexed while the fresh Qdrant server held zero points. Every file looked
+  unchanged, nothing was written, and the run reported success over an empty
+  index. The indexer now counts the collection and re-indexes everything if the
+  state and the database disagree.
 
 ---
 
@@ -424,7 +442,7 @@ invalid key, so you can tell the two apart immediately.
 ## Testing
 
 ```bash
-python -m unittest discover -s tests -t . -v      # 134 tests
+python -m unittest discover -s tests -t . -v      # 183 tests
 ```
 
 Qdrant runs embedded, so the end-to-end tests need no server and run in CI.
@@ -465,7 +483,6 @@ Known and deliberate, rather than hidden:
 - **The evaluation corpus is synthetic and small.** Real resumes cannot be committed to a public repo, but these fixtures are cleaner and more uniformly structured than real CVs, so the absolute numbers are optimistic. The *relative* comparisons between configurations are the useful part.
 - **No OCR.** Scanned image-only PDFs extract no text and are skipped with a warning.
 - **Reranker latency dominates and is not optimised.** Measured: embed 12–51 ms, retrieve 1.3–2.6 ms, rerank 1505–2113 ms — about 97% of request time, for only 3 candidates. It has not been measured with a full 30-candidate shortlist, and there is no batching, caching or timeout tuning.
-- **The Docker image build is unverified.** The Docker daemon was unavailable during development, so `docker compose up` has not been executed end-to-end. Everything else here was run for real.
 - **Model ids drift.** The Groq default is `openai/gpt-oss-120b`, verified working; the previous `llama-3.3-70b-versatile` now 404s. The Gemini default `gemini-2.5-flash` is **unverified** — no Gemini key was tested. Both are configurable via `GEMINI_MODEL` / `GROQ_MODEL`.
 - **Results are from one model on a small corpus.** The reranker numbers come from a single provider (Groq `openai/gpt-oss-120b`) over 15 queries and 32 synthetic CVs, and the +0.03 lift rests on one mostly-clean run. They show the pipeline works and that retrieval quality erodes the reranker's margin; they are not a general claim about reranking.
 
@@ -474,6 +491,6 @@ Known and deliberate, rather than hidden:
 In rough priority order:
 
 1. Repeat the hybrid + reranker measurement across several runs, so the +0.03 lift is a range rather than a single observation.
-2. Verify the Docker image build; the daemon was never available during development.
-3. Grow the query set further. 15 labelled queries is enough to separate 0.07 nDCG but not 0.03.
-4. Measure metadata-extraction accuracy against a labelled set, rather than spot-checking it.
+2. Grow the query set further. 15 labelled queries is enough to separate 0.07 nDCG but not 0.03.
+3. Measure metadata-extraction accuracy against a labelled set, rather than spot-checking it.
+4. Pin `qdrant-client` more tightly. The Docker build resolved 1.19.1 against a `~=1.18` pin; it works, but a loose pin is exactly what broke `.search()` before.
