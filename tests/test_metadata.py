@@ -5,7 +5,6 @@ is never abandoned when the expensive one fails. Both properties are asserted
 here, alongside rejection of implausible model output.
 """
 
-import json
 import shutil
 import tempfile
 import unittest
