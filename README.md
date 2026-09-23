@@ -147,28 +147,56 @@ A quarter of the corpus is deliberate distractors: a QA engineer whose CV is den
 
 | configuration | recall@5 | nDCG@5 | pool recall |
 |---|---|---|---|
-| **Cross-role** | | | |
-| whole CV + hybrid | 0.870 | **0.947** | 0.870 |
-| window + hybrid | 0.870 | 0.932 | 0.920 |
-| window60 + hybrid | 0.870 | 0.923 | 0.870 |
-| section + grouped | 0.830 | 0.844 | 0.960 |
-| section + hybrid | 0.830 | 0.890 | 0.960 |
-| **Within-role** | | | |
-| whole CV + grouped | 0.467 | 0.468 | 0.822 |
-| whole CV + hybrid | 0.606 | 0.718 | 0.933 |
-| section + grouped | 0.467 | 0.468 | 0.822 |
-| section + hybrid | 0.672 | 0.689 | **1.000** |
-| window + grouped | 0.683 | 0.574 | 0.944 |
-| **window + hybrid** | **0.756** | **0.790** | **1.000** |
-| **window60 + hybrid** | **0.756** | **0.791** | **1.000** |
+| **Cross-role** (8 queries) | | | |
+| whole CV + grouped | 0.919 | 0.954 | 0.950 |
+| whole CV + hybrid | 0.919 | **0.967** | 0.919 |
+| window + grouped | 0.919 | 0.951 | 0.950 |
+| **window + hybrid** | 0.919 | 0.958 | 0.950 |
+| section + grouped | 0.894 | 0.902 | 0.975 |
+| section + hybrid | 0.894 | 0.927 | 0.975 |
+| **Within-role** (7 queries) | | | |
+| whole CV + flat | 0.648 | 0.677 | 0.900 |
+| whole CV + hybrid | 0.795 | 0.803 | 0.871 |
+| window + flat | 0.648 | 0.677 | 0.900 |
+| window + grouped | 0.648 | 0.677 | 0.900 |
+| **window + hybrid** | **0.814** | **0.833** | 0.900 |
+| window60 + hybrid | 0.743 | 0.756 | 0.924 |
+| section + flat | 0.638 | 0.647 | 0.807 |
+| section + grouped | 0.638 | 0.647 | 0.867 |
+| section + hybrid | 0.726 | 0.761 | 0.867 |
 
 **What this actually shows:**
 
-1. **Grouping and hybrid both attack the same bottleneck, and both work.** Grouping raised pool recall from 0.617 → 0.822 (section) and 0.550 → 0.822 (whole CV); adding BM25 took it to **0.933**. Flat dense retrieval was silently discarding a third of the relevant candidates before the reranker ever saw them.
-2. **The cross-role set is nearly useless as a benchmark.** It sits at 0.92 nDCG for almost every configuration. Reporting only these numbers would make the system look better than it is.
-3. **Retrieval is no longer the bottleneck.** Hybrid retrieval with window chunking reaches **pool recall 1.000** on the within-role set — every relevant candidate now reaches the reranker. Whatever quality is still missing is a ranking problem, not a retrieval one.
+1. **Hybrid retrieval is the largest single win.** On the within-role set it lifts nDCG@5 from 0.677 to **0.833** and recall@5 from 0.648 to **0.814**. Exact technical tokens are where dense embeddings are weakest and BM25 is strongest.
 
-4. **Section chunking lost, and the default changed because of it.** Heading-based sectioning was the original design and seemed principled. On the first corpus it was indistinguishable from a sliding window, because 55-word fixtures chunk identically under any strategy. Once the corpus was rebuilt at realistic length with varied layouts — including CVs with no headings at all — the window won consistently: within-role nDCG **0.790 vs 0.689**, cross-role **0.932 vs 0.890**, across every retrieval mode. The shipped default is now the window (`CHUNK_STRATEGY=section` restores the old behaviour). This is the one conclusion in the project that reversed under better data, which is the whole reason the corpus was rebuilt.
+2. **Grouping's value depends on how many chunks each candidate has.** With section chunking (~9 chunks per CV) it lifts pool recall 0.807 → 0.867, because a few verbose CVs otherwise monopolise the budget. With the shipped window chunking (2 chunks per CV) flat retrieval already returns nearly distinct candidates, and grouping changes the metrics not at all — it only guarantees the property rather than leaving it to luck. An earlier, much larger figure for this came from the short-fixture corpus and no longer holds.
+2. **The cross-role set is nearly useless as a benchmark.** It sits at 0.92 nDCG for almost every configuration. Reporting only these numbers would make the system look better than it is.
+3. **Retrieval still loses ~10% of relevant candidates.** Pool recall on the within-role set is 0.900, so about one relevant candidate in ten never reaches the reranker and can never be recovered. An earlier draft of this README claimed 1.000; that number was an artifact of the evaluation bug described below, and is corrected here.
+
+4. **Section chunking lost, and the default changed because of it.** Heading-based sectioning was the original design and seemed principled. On the first corpus it was indistinguishable from a sliding window, because 55-word fixtures chunk identically under any strategy. Once the corpus was rebuilt at realistic length with varied layouts — including CVs with no headings at all — the window won consistently: within-role nDCG **0.833 vs 0.761**, cross-role **0.958 vs 0.927**, across every retrieval mode. The shipped default is now the window (`CHUNK_STRATEGY=section` restores the old behaviour). This is the one conclusion in the project that reversed under better data, which is the whole reason the corpus was rebuilt.
+
+### The benchmark had a bug that flattered it
+
+Worth recording, because it is the failure mode evaluation harnesses are most
+prone to: **the measuring instrument was wrong, and it was wrong in the
+direction that made the results look better.**
+
+`build_index` rebuilt the collection between ablation rows with
+`delete_collection` followed by `create_collection`. In embedded Qdrant that
+does **not** purge the points. Each new chunking strategy was upserted on top of
+the previous one, so every row after the first was retrieving over a growing
+mixture of all strategies — and more chunks meant more chances to match, which
+inflated pool recall to a spurious 1.000.
+
+It surfaced only because the same configuration scored differently depending on
+what had been built before it. Each build now uses a fresh collection name, and
+two regression tests pin it: one asserts a rebuilt collection contains exactly
+its own points, the other asserts an identical configuration scores identically
+regardless of what ran first.
+
+Every number in this README was re-measured after the fix. The headline
+conclusions — hybrid wins, window beats section — survived; the specific figures
+did not, and the corrected ones are above.
 
 **Caveat, stated plainly:** 3 within-role queries over 32 CVs is still a small sample, and differences of 0.03 nDCG remain inside the noise a single query could produce. The chunking and hybrid conclusions are held with more confidence than that margin because they are consistent in direction across every retrieval mode and both query sets, not because any single figure is decisive. The fixtures are now 255–304 words with three layout variants — realistic enough for chunking strategies to differ, still shorter than a real 400–800 word CV.
 
@@ -222,14 +250,21 @@ search was added.
    figure. Within-role nDCG moved ±0.03; cross-role recall and precision were
    identical in all 5.
 
-**With hybrid retrieval underneath, one clean run** measured within-role
-nDCG@5 **0.921** and cross-role **0.881** — consistent with hybrid raising the
-retrieval ceiling the reranker works against.
+**On the current corpus and the shipped configuration** (window + hybrid, 15
+queries), one mostly-clean run measured within-role nDCG@5 **0.865** against a
+retrieval-only baseline of **0.833** — a lift of about **+0.03**.
 
-Only one run: the Groq free tier's daily token quota (200,000) was exhausted
-part-way through repeating it, and every subsequent run degraded to vector
-fallback. Degraded runs are not reported as results. Treat 0.921 as a single
-observation, not a range, until it is repeated on a fresh quota.
+That is far smaller than the +0.27 measured earlier, and the reason is the
+point: **the reranker's value depends on how weak retrieval is.** When retrieval
+scored 0.605, the LLM had a great deal to fix. Now that hybrid retrieval scores
+0.833, most of what the reranker used to contribute has already been done
+upstream, more cheaply and without an API call. Improving retrieval did not just
+raise the ceiling — it ate the reranker's margin.
+
+Treat this as one observation, not a range. 13 of 15 queries were reranked in
+that run; the other two hit the daily token quota and fell back. A full rerank
+pass costs roughly 55,000 tokens, so the Groq free tier's 200,000/day allows
+about three runs. Repeating this on a fresh quota is the top open item.
 
 **Measured latency** (3 live API requests, 3 candidates each):
 

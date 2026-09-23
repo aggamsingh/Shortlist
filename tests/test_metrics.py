@@ -145,11 +145,15 @@ class CorpusIntegrityTest(unittest.TestCase):
             )
             self.assertEqual(extract_location(text), candidate["location"], candidate["id"])
 
-    def test_corpus_retains_distractors(self):
-        """Distractors are what stop keyword matching from scoring well."""
+    def test_every_query_faces_a_large_distractor_field(self):
+        """Distractors are what stop keyword matching from scoring well.
+
+        Measured per query: a query with only a handful of non-relevant
+        candidates is trivially easy regardless of the retrieval strategy.
+        """
         from evaluation.corpus import corpus_stats
 
-        self.assertGreaterEqual(corpus_stats()["distractors"], 5)
+        self.assertGreaterEqual(corpus_stats()["min_distractors_per_query"], 20)
 
 
 if __name__ == "__main__":

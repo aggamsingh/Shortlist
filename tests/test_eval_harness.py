@@ -79,6 +79,52 @@ class EvalHarnessTest(unittest.TestCase):
         counts = {len(chunk_cv(render_cv(c))) for c in CANDIDATES}
         self.assertGreater(len(counts), 1, "every CV chunks identically")
 
+    def test_rebuilding_does_not_inherit_the_previous_index(self):
+        """Each build must be isolated, or every ablation row is meaningless.
+
+        delete_collection + create_collection does NOT purge points in embedded
+        Qdrant. Rebuilding with a different chunker left the old chunks in place
+        and upserted the new ones on top, so a run comparing four chunking
+        strategies was really comparing progressively larger mixtures of all of
+        them -- and it inflated pool recall to a spurious 1.000.
+        """
+        from evaluation.corpus import CANDIDATES
+
+        window_chunks = run_eval.build_index(
+            self.client, self.embedder, run_eval.CHUNKERS["window"]
+        )
+        run_eval.build_index(self.client, self.embedder, run_eval.CHUNKERS["section"])
+        again = run_eval.build_index(
+            self.client, self.embedder, run_eval.CHUNKERS["window"]
+        )
+
+        points, _ = self.client.scroll(
+            collection_name=run_eval.COLLECTION, limit=10000, with_payload=False
+        )
+        self.assertEqual(again, window_chunks)
+        self.assertEqual(
+            len(points), window_chunks,
+            "collection contains points from a previous build",
+        )
+        self.assertLess(len(points), 288, "section chunks leaked into a window build")
+
+    def test_identical_config_scores_identically_after_other_builds(self):
+        """The direct symptom the isolation bug produced."""
+        from evaluation.corpus import HARD_QUERIES
+
+        run_eval.build_index(self.client, self.embedder, run_eval.CHUNKERS["window"])
+        alone = run_eval.evaluate_config(
+            self.client, self.embedder, "hybrid", 10, 5, queries=HARD_QUERIES
+        )
+        for name in ("whole", "section"):
+            run_eval.build_index(self.client, self.embedder, run_eval.CHUNKERS[name])
+        run_eval.build_index(self.client, self.embedder, run_eval.CHUNKERS["window"])
+        after = run_eval.evaluate_config(
+            self.client, self.embedder, "hybrid", 10, 5, queries=HARD_QUERIES
+        )
+        for key in ("recall@5", "ndcg@5", "pool_recall"):
+            self.assertAlmostEqual(alone[key], after[key], places=9, msg=key)
+
     def test_grouped_retrieval_returns_distinct_candidates(self):
         vector = self.embedder.embed_text(QUERIES[0]["job_description"])
         ranked = run_eval.retrieve_grouped(self.client, vector, budget=10)
