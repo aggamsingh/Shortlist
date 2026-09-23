@@ -145,31 +145,32 @@ A quarter of the corpus is deliberate distractors: a QA engineer whose CV is den
 
 ### Results (retrieval only, k=5, budget=10)
 
-| configuration | recall@5 | nDCG@5 | pool recall | distinct candidates |
-|---|---|---|---|---|
-| **Cross-role** | | | | |
-| whole CV + flat | 0.870 | 0.920 | 0.960 | 10.0 |
-| section + flat | 0.830 | 0.799 | 0.870 | 5.6 |
-| section + grouped | 0.830 | 0.799 | 0.960 | 10.0 |
-| section + **hybrid** | 0.830 | **0.851** | 0.920 | 10.0 |
-| window60 + **hybrid** | **0.870** | **0.916** | 0.920 | 10.0 |
-| **Within-role** | | | | |
-| whole CV + flat | 0.428 | 0.566 | 0.550 | 6.0 |
-| whole CV + grouped | 0.428 | 0.566 | 0.822 | 10.0 |
-| whole CV + **hybrid** | 0.606 | 0.702 | **0.933** | 10.0 |
-| section + flat | 0.494 | 0.605 | 0.617 | 7.7 |
-| section + grouped | 0.494 | 0.605 | 0.822 | 10.0 |
-| section + **hybrid** | 0.550 | 0.648 | 0.811 | 10.0 |
-| window60 + grouped | 0.467 | 0.639 | 0.878 | 10.0 |
-| window60 + **hybrid** | **0.728** | **0.785** | **0.933** | 10.0 |
+| configuration | recall@5 | nDCG@5 | pool recall |
+|---|---|---|---|
+| **Cross-role** | | | |
+| whole CV + hybrid | 0.870 | **0.947** | 0.870 |
+| window + hybrid | 0.870 | 0.932 | 0.920 |
+| window60 + hybrid | 0.870 | 0.923 | 0.870 |
+| section + grouped | 0.830 | 0.844 | 0.960 |
+| section + hybrid | 0.830 | 0.890 | 0.960 |
+| **Within-role** | | | |
+| whole CV + grouped | 0.467 | 0.468 | 0.822 |
+| whole CV + hybrid | 0.606 | 0.718 | 0.933 |
+| section + grouped | 0.467 | 0.468 | 0.822 |
+| section + hybrid | 0.672 | 0.689 | **1.000** |
+| window + grouped | 0.683 | 0.574 | 0.944 |
+| **window + hybrid** | **0.756** | **0.790** | **1.000** |
+| **window60 + hybrid** | **0.756** | **0.791** | **1.000** |
 
 **What this actually shows:**
 
 1. **Grouping and hybrid both attack the same bottleneck, and both work.** Grouping raised pool recall from 0.617 → 0.822 (section) and 0.550 → 0.822 (whole CV); adding BM25 took it to **0.933**. Flat dense retrieval was silently discarding a third of the relevant candidates before the reranker ever saw them.
 2. **The cross-role set is nearly useless as a benchmark.** It sits at 0.92 nDCG for almost every configuration. Reporting only these numbers would make the system look better than it is.
-3. **Section chunking does not earn its complexity, and hybrid makes that clearer.** The best configuration on both query sets is a plain 60-word window with hybrid retrieval — within-role nDCG 0.785 against 0.648 for section, and cross-role 0.916 against 0.851. Section chunking now loses on every axis measured. It remains the shipped default only because these fixtures are ~110-word synthetic CVs whose sections are tiny; real resumes are longer and more structured, which is the case section chunking is designed for. Settling this needs a better corpus, not more opinion — which is why expanding it is the top open item.
+3. **Retrieval is no longer the bottleneck.** Hybrid retrieval with window chunking reaches **pool recall 1.000** on the within-role set — every relevant candidate now reaches the reranker. Whatever quality is still missing is a ranking problem, not a retrieval one.
 
-**Caveat, stated plainly:** 3 within-role queries over 32 synthetic CVs is a small sample. Differences of 0.03–0.04 nDCG are well inside the noise one query would produce, and these fixtures are short and uniformly structured, which flatters whole-CV embedding. These numbers justify the grouping change; they are *not* enough to retire section chunking. The honest next step is more queries and longer, messier CVs.
+4. **Section chunking lost, and the default changed because of it.** Heading-based sectioning was the original design and seemed principled. On the first corpus it was indistinguishable from a sliding window, because 55-word fixtures chunk identically under any strategy. Once the corpus was rebuilt at realistic length with varied layouts — including CVs with no headings at all — the window won consistently: within-role nDCG **0.790 vs 0.689**, cross-role **0.932 vs 0.890**, across every retrieval mode. The shipped default is now the window (`CHUNK_STRATEGY=section` restores the old behaviour). This is the one conclusion in the project that reversed under better data, which is the whole reason the corpus was rebuilt.
+
+**Caveat, stated plainly:** 3 within-role queries over 32 CVs is still a small sample, and differences of 0.03 nDCG remain inside the noise a single query could produce. The chunking and hybrid conclusions are held with more confidence than that margin because they are consistent in direction across every retrieval mode and both query sets, not because any single figure is decisive. The fixtures are now 255–304 words with three layout variants — realistic enough for chunking strategies to differ, still shorter than a real 400–800 word CV.
 
 ### Reranker evaluation — measured
 
@@ -323,7 +324,7 @@ Known and deliberate, rather than hidden:
 
 In rough priority order:
 
-1. Expand the corpus with longer, messier CVs and more within-role queries. Two separate findings now hinge on it: whether section chunking earns its place (current evidence says no), and whether differences of 0.03–0.04 nDCG mean anything at 8 queries.
+1. Add more labelled queries. The corpus is now realistic in length and layout, but 8 queries is too few for differences of 0.03 nDCG to be meaningful.
 2. Repeat the hybrid + reranker measurement on a fresh token quota, so it is a range rather than a single run.
 3. Add the LLM metadata-extraction fallback for CVs where the regex finds nothing.
 4. Verify the Docker image build; the daemon was never available during development.

@@ -17,7 +17,7 @@ from indexer.utils import (
 from indexer.parser import (
     parse_cv,
     extract_years_of_experience,
-    chunk_cv,
+    chunk_resume,
     normalize_location,
     COMMON_CITIES,
 )
@@ -55,13 +55,31 @@ def word_boundary(term: str) -> str:
     """Regex matching `term` as a whole word."""
     return r"\b" + re.escape(term) + r"\b"
 
+# Lines at the top of a CV that plausibly hold contact details. A candidate's
+# own location lives here; cities further down usually belong to an employer or
+# a university.
+CONTACT_BLOCK_LINES = 6
+
+
 def extract_location(text: str) -> str:
-    """Basic extraction of location based on common cities."""
-    text_lower = text.lower()
-    for city in COMMON_CITIES:
-        # Match city with word boundaries
-        if re.search(word_boundary(city), text_lower):
-            return normalize_location(city)
+    """Extract the candidate's city, preferring the contact block at the top.
+
+    Scanning the whole document and taking the first match is wrong on real CVs:
+    an education section reading "University of Delhi" or an employer address
+    will outvote the candidate's actual city. Found when the evaluation corpus
+    grew realistic education entries and ten candidates suddenly relocated.
+
+    The header is searched first; the rest of the document is only a fallback,
+    which still beats returning Unknown for a CV that lists its city late.
+    """
+    lines = [line for line in text.splitlines() if line.strip()]
+    header = "\n".join(lines[:CONTACT_BLOCK_LINES]).lower()
+    body = text.lower()
+
+    for scope in (header, body):
+        for city in COMMON_CITIES:
+            if re.search(word_boundary(city), scope):
+                return normalize_location(city)
     return "Unknown"
 
 def clean_candidate_name(filename: str) -> str:
@@ -218,7 +236,7 @@ def main():
             "years": extract_years_of_experience(cv_text),
             "location": extract_location(cv_text),
             "candidate_uuid": uuid.uuid5(uuid.NAMESPACE_DNS, relative_path),
-            "chunks": chunk_cv(cv_text),
+            "chunks": chunk_resume(cv_text),
         }
 
     # 7. Fit BM25 across every chunk in the corpus.
