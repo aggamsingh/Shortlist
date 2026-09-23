@@ -542,6 +542,35 @@ QUERIES = [
         ),
         "relevance": {"c14": 2, "c15": 1},
     },
+    {
+        # The distractors become targets here. A system that simply suppresses
+        # "QA engineer who writes Python" would fail this, which is the point:
+        # they are wrong for a backend role, not globally unhireable.
+        "id": "q6_qa_automation",
+        "job_description": (
+            "QA Automation Engineer to build and maintain automated test suites in "
+            "Python. You will own Selenium UI automation and pytest frameworks and "
+            "keep regression suites running in the CI pipeline."
+        ),
+        "relevance": {"c16": 2},
+    },
+    {
+        "id": "q7_technical_writer",
+        "job_description": (
+            "Senior Technical Writer to own developer documentation for our REST "
+            "APIs and developer platform, including OpenAPI reference material, "
+            "onboarding guides and a maintained style guide."
+        ),
+        "relevance": {"c17": 2},
+    },
+    {
+        "id": "q8_java_backend",
+        "job_description": (
+            "Backend Engineer with strong Java and Spring Boot experience to build "
+            "microservices, including event-driven integration over Kafka."
+        ),
+        "relevance": {"c18": 2},
+    },
 ]
 
 # Hard queries: every strong candidate here sits inside the Python backend
@@ -579,6 +608,47 @@ HARD_QUERIES = [
             "Kubernetes, Terraform and CI/CD pipelines are part of the job."
         ),
         "relevance": {"c29": 2, "c01": 2, "c03": 1, "c31": 1, "c04": 1},
+    },
+    {
+        "id": "h4_django_web",
+        "job_description": (
+            "Python Backend Engineer for a large Django web application. You will "
+            "work daily with the Django ORM and Django REST Framework, and own "
+            "relational data modelling on PostgreSQL."
+        ),
+        # Partial: web API work on a different framework (Flask), or relational
+        # modelling without Django.
+        "relevance": {"c02": 2, "c23": 2, "c21": 1, "c22": 1, "c30": 1},
+    },
+    {
+        "id": "h5_db_performance",
+        "job_description": (
+            "Python Backend Engineer with strong relational database skills. The "
+            "role centres on query optimisation, indexing, and profiling slow "
+            "endpoints against PostgreSQL under real production load."
+        ),
+        "relevance": {"c02": 2, "c27": 2, "c28": 1, "c22": 1, "c23": 1},
+    },
+    {
+        "id": "h6_lexical_search",
+        "job_description": (
+            "Backend Engineer to own keyword search for a marketplace catalogue: "
+            "Elasticsearch, BM25 relevance tuning and query analysis. This is "
+            "lexical search work, not embedding based retrieval."
+        ),
+        # A deliberately adversarial pairing with h1: the vector-search people are
+        # the WRONG answer here, and a system that has learned "search -> vector
+        # database" from the other queries will get this backwards.
+        "relevance": {"c23": 2, "c24": 2, "c26": 1, "c10": 1},
+    },
+    {
+        "id": "h7_task_queues",
+        "job_description": (
+            "Python Backend Engineer for asynchronous background processing. You "
+            "will own Celery task queues, RabbitMQ messaging and reliable retry "
+            "semantics for long running jobs."
+        ),
+        "relevance": {"c23": 2, "c02": 2, "c03": 1},
     },
 ]
 
@@ -653,13 +723,28 @@ def render_cv(candidate: dict) -> str:
 
 
 def corpus_stats() -> dict:
-    """Small summary used by the eval report header."""
-    labelled = {cid for q in ALL_QUERIES for cid in q["relevance"]}
+    """Summary used by the eval report header.
+
+    Distraction is measured PER QUERY, not globally. Counting candidates that
+    are never relevant to anything understates it badly once most candidates are
+    the target of some query: what matters is that each individual query has a
+    large field of non-relevant candidates to be confused by, many of them
+    sharing its keywords.
+    """
+    per_query_distractors = [
+        len(CANDIDATES) - len(q["relevance"]) for q in ALL_QUERIES
+    ]
+    never_relevant = len(CANDIDATES) - len(
+        {cid for q in ALL_QUERIES for cid in q["relevance"]}
+    )
     return {
         "candidates": len(CANDIDATES),
         "queries": len(ALL_QUERIES),
         "cross_role_queries": len(QUERIES),
         "within_role_queries": len(HARD_QUERIES),
-        "labelled_candidates": len(labelled),
-        "distractors": len(CANDIDATES) - len(labelled),
+        "min_distractors_per_query": min(per_query_distractors),
+        "mean_distractors_per_query": round(
+            sum(per_query_distractors) / len(per_query_distractors), 1
+        ),
+        "never_relevant_anywhere": never_relevant,
     }

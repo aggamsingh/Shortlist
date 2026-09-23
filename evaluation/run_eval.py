@@ -27,7 +27,13 @@ from indexer.embedder import CVEmbedder
 from indexer.parser import chunk_by_words, chunk_cv, clean_text
 from indexer.sparse import BM25Encoder
 
+# Each build gets a FRESH collection name. delete_collection + create_collection
+# does not actually purge points in embedded Qdrant: rebuilding with a different
+# chunker left the previous chunker's points in place and the new ones were
+# upserted on top, so every ablation row after the first silently retrieved over
+# a mixture of strategies. Unique names sidestep that entirely.
 COLLECTION = "eval_resumes"
+_BUILD_COUNTER = 0
 SPARSE_VECTOR_NAME = "text"
 
 # Fitted in build_index and reused by the hybrid retriever below.
@@ -78,7 +84,9 @@ def _sparse(text: str) -> models.SparseVector:
 
 def build_index(client: QdrantClient, embedder: CVEmbedder, chunker) -> int:
     """(Re)build the eval collection using the given chunking strategy."""
-    global _BM25
+    global _BM25, COLLECTION, _BUILD_COUNTER
+    _BUILD_COUNTER += 1
+    COLLECTION = f"eval_resumes_{_BUILD_COUNTER}"
     if client.collection_exists(COLLECTION):
         client.delete_collection(COLLECTION)
     client.create_collection(
@@ -283,7 +291,7 @@ def main() -> None:
     print("Shortlist - retrieval evaluation")
     print(
         f"corpus: {stats['candidates']} CVs, {stats['queries']} job descriptions, "
-        f"{stats['distractors']} never-relevant distractors"
+        f"{stats['min_distractors_per_query']}+ non-relevant candidates per query"
     )
     print(f"retrieval budget: {args.budget}   metrics cutoff: k={args.k}\n")
 
@@ -312,8 +320,10 @@ def main() -> None:
         ]
 
         if not args.ablations:
-            n_chunks = build_index(client, embedder, CHUNKERS["section"])
-            print(f"indexed {n_chunks} chunks (section chunking)\n")
+            # Must mirror the shipped default (indexer.parser.chunk_resume), or
+            # the headline numbers describe a configuration nobody actually runs.
+            n_chunks = build_index(client, embedder, CHUNKERS["window"])
+            print(f"indexed {n_chunks} chunks (window chunking, the shipped default)\n")
             for title, queries in suites:
                 print(title)
                 print(header(args.k))
@@ -321,7 +331,7 @@ def main() -> None:
                     client, embedder, "hybrid", args.budget, args.k, reranker,
                     queries=queries,
                 )
-                label = "section + hybrid" + (" + rerank" if reranker else "")
+                label = "window + hybrid" + (" + rerank" if reranker else "")
                 print(format_row(label, metrics, args.k))
                 print()
         else:
@@ -343,12 +353,12 @@ def main() -> None:
                             )
                         )
                 if reranker:
-                    build_index(client, embedder, CHUNKERS["section"])
+                    build_index(client, embedder, CHUNKERS["window"])
                     metrics = evaluate_config(
                         client, embedder, "hybrid", args.budget, args.k, reranker,
                         queries=queries,
                     )
-                    print(format_row("section  + hybrid   + LLM rerank", metrics, args.k))
+                    print(format_row("window   + hybrid   + LLM rerank", metrics, args.k))
                 print()
 
         print("cands = mean distinct candidates reaching the reranker (higher is better)")
