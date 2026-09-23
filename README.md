@@ -353,13 +353,13 @@ Known and deliberate, rather than hidden:
 - **Reranker latency dominates and is not optimised.** Measured: embed 12–51 ms, retrieve 1.3–2.6 ms, rerank 1505–2113 ms — about 97% of request time, for only 3 candidates. It has not been measured with a full 30-candidate shortlist, and there is no batching, caching or timeout tuning.
 - **The Docker image build is unverified.** The Docker daemon was unavailable during development, so `docker compose up` has not been executed end-to-end. Everything else here was run for real.
 - **Model ids drift.** The Groq default is `openai/gpt-oss-120b`, verified working; the previous `llama-3.3-70b-versatile` now 404s. The Gemini default `gemini-2.5-flash` is **unverified** — no Gemini key was tested. Both are configurable via `GEMINI_MODEL` / `GROQ_MODEL`.
-- **Results are from one model on a small corpus.** The reranker numbers come from a single provider over 8 queries. They show the pipeline works; they are not a general claim about reranking.
+- **Results are from one model on a small corpus.** The reranker numbers come from a single provider (Groq `openai/gpt-oss-120b`) over 15 queries and 32 synthetic CVs, and the +0.03 lift rests on one mostly-clean run. They show the pipeline works and that retrieval quality erodes the reranker's margin; they are not a general claim about reranking.
 
 ## Next steps
 
 In rough priority order:
 
-1. Add more labelled queries. The corpus is now realistic in length and layout, but 8 queries is too few for differences of 0.03 nDCG to be meaningful.
-2. Repeat the hybrid + reranker measurement on a fresh token quota, so it is a range rather than a single run.
-3. Add the LLM metadata-extraction fallback for CVs where the regex finds nothing.
-4. Verify the Docker image build; the daemon was never available during development.
+1. Add the LLM metadata-extraction fallback for CVs where the regex finds nothing. This is the weakest remaining component and the one an interviewer would probe first.
+2. Repeat the hybrid + reranker measurement across several runs, so the +0.03 lift is a range rather than a single observation.
+3. Verify the Docker image build; the daemon was never available during development.
+4. Grow the query set further. 15 labelled queries is enough to separate 0.07 nDCG but not 0.03.
