@@ -118,6 +118,39 @@ LLM output is the least reliable input in the system, so `api/reranker.py` assum
 - **Prompt size is capped** per candidate and per request, because concatenated chunks are otherwise unbounded input to a metered API.
 - **Rate limits are retried; quotas are not.** A per-minute cap clears in seconds, so it is worth waiting out with backoff. An exhausted daily quota reports a wait of minutes to hours, and sleeping through a short backoff for that only delays the inevitable fallback — so when a provider asks for longer than the retry ceiling, the request degrades immediately. A retired model id or a bad key never retries at all.
 
+### Metadata extraction: cheap path first, LLM only on failure
+
+Regex extraction is fast and free but brittle. Years of experience only matched
+phrases like "5 years of experience", so a CV listing date ranges (`2018 - 2024`)
+yielded 0. Location matched eleven hardcoded cities, so anyone elsewhere was
+`Unknown`. The candidate's name came from the *filename*, which is wrong the
+moment the file is called `cv_final_v2.pdf`.
+
+Using an LLM for all of it would fix that and cost a call per CV — real money and
+real latency for a job regex already does correctly most of the time. So the LLM
+is asked only about the fields regex could not resolve, and only about those
+fields: a CV missing just its location never sends a prompt mentioning name or
+experience. Results are cached by content hash, so re-indexing never pays twice.
+
+**The expensive path is therefore proportional to the failure rate of the cheap
+one, not to corpus size.** On a two-CV demo where one resume defeats every regex:
+
+```
+Metadata: 1 regex-only, 0 cached, 1 LLM calls, 0 LLM failures (1/2 CVs needed the expensive path)
+  cv_final_v2.docx  -> name "Priyanka Deshmukh" (from the CV body, not the filename)
+                       9 years (inferred from 2015-2024 date ranges)
+                       "Nagpur" (a city absent from the hardcoded list)
+```
+
+Re-running the same corpus afterwards costs **zero** calls.
+
+Model output is not trusted: a returned name must pass a character allowlist and
+a job-title check (`"Senior Backend Engineer @ Acme!!"` is rejected — a plain
+letter-ratio test accepts it, since it is 90% letters), and years outside 0–60
+are discarded. Anything rejected falls back to the regex answer. One hard
+provider failure disables the fallback for the rest of the run, so an exhausted
+quota costs one failed call rather than one per remaining CV.
+
 ### Readiness is handled in the application, not by a compose healthcheck
 
 The database and API start together, so the first connection races container startup. `connect_qdrant()` retries with backoff and verifies a real round trip. This also survives a Qdrant restart while the API is already running — something a startup-only healthcheck never sees.
@@ -346,7 +379,7 @@ Every value lives in `.env` — see `.env.example` for the annotated list. The o
 
 Known and deliberate, rather than hidden:
 
-- **Metadata extraction is naive.** Years of experience is a regex over phrases like "5 years of experience"; a CV that only lists date ranges yields `0`. Location matches a hardcoded list of eleven Indian cities. Candidate name comes from the *filename*. This is a cost decision — an LLM extraction pass per CV is accurate but expensive at 200k resumes — and the right design is a cheap regex fast path with an LLM fallback only when it fails. That fallback is not built yet.
+- **Metadata extraction still leans on regex first.** That is deliberate (see above), but the regex path itself is unchanged: years from phrases like "5 years of experience", location from eleven hardcoded Indian cities, name from the filename. The LLM fallback covers the failures rather than improving the fast path, and its accuracy has been checked on a handful of CVs, not measured across a labelled set.
 - **Location filtering is exact-match on a guessed city.** No geocoding, no radius, no remote handling.
 - **The evaluation corpus is synthetic and small.** Real resumes cannot be committed to a public repo, but these fixtures are cleaner and more uniformly structured than real CVs, so the absolute numbers are optimistic. The *relative* comparisons between configurations are the useful part.
 - **No OCR.** Scanned image-only PDFs extract no text and are skipped with a warning.
@@ -359,7 +392,7 @@ Known and deliberate, rather than hidden:
 
 In rough priority order:
 
-1. Add the LLM metadata-extraction fallback for CVs where the regex finds nothing. This is the weakest remaining component and the one an interviewer would probe first.
-2. Repeat the hybrid + reranker measurement across several runs, so the +0.03 lift is a range rather than a single observation.
-3. Verify the Docker image build; the daemon was never available during development.
-4. Grow the query set further. 15 labelled queries is enough to separate 0.07 nDCG but not 0.03.
+1. Repeat the hybrid + reranker measurement across several runs, so the +0.03 lift is a range rather than a single observation.
+2. Verify the Docker image build; the daemon was never available during development.
+3. Grow the query set further. 15 labelled queries is enough to separate 0.07 nDCG but not 0.03.
+4. Measure metadata-extraction accuracy against a labelled set, rather than spot-checking it.

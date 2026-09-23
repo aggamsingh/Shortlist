@@ -23,6 +23,7 @@ from indexer.parser import (
 )
 from indexer.embedder import CVEmbedder
 from indexer.sparse import BM25Encoder
+from indexer.metadata import MetadataExtractor
 
 # Load environment variables
 load_dotenv()
@@ -45,6 +46,10 @@ QDRANT_PATH = os.getenv("QDRANT_PATH")
 # fall back to dense-only indexing.
 HYBRID_RETRIEVAL = os.getenv("HYBRID_RETRIEVAL", "true").strip().lower() not in ("0", "false", "no")
 BM25_STATE_PATH = os.getenv("BM25_STATE_PATH", "./data/bm25_state.json")
+
+# Metadata extraction falls back to an LLM only for the fields regex could not
+# resolve, and caches by content hash so re-indexing never pays twice.
+METADATA_CACHE_PATH = os.getenv("METADATA_CACHE_PATH", "./data/metadata_cache.json")
 
 # The dense vector stays unnamed ("") so existing dense-only queries and any
 # previously written points keep working; sparse is added as a named vector.
@@ -204,6 +209,7 @@ def main():
     # next to embedding -- the expensive step still runs only for changed files
     # in pass two. With HYBRID_RETRIEVAL off, unchanged files are skipped here
     # entirely and this becomes the original single-pass behaviour.
+    metadata = MetadataExtractor(cache_path=METADATA_CACHE_PATH)
     parsed = {}
     for file_path in cv_files:
         filename = os.path.basename(file_path)
@@ -229,12 +235,21 @@ def main():
             continue
 
         relative_path = os.path.relpath(file_path, CV_FOLDER_PATH)
+        # Regex first; the LLM is consulted only for fields it could not resolve,
+        # and only for files being (re)indexed.
+        meta = metadata.extract(
+            cv_text, clean_candidate_name(filename), file_hash=file_hash
+        ) if not unchanged else {
+            "name": clean_candidate_name(filename),
+            "years_of_experience": extract_years_of_experience(cv_text),
+            "location": extract_location(cv_text),
+        }
         parsed[file_path] = {
             "hash": file_hash,
             "unchanged": unchanged,
-            "name": clean_candidate_name(filename),
-            "years": extract_years_of_experience(cv_text),
-            "location": extract_location(cv_text),
+            "name": meta["name"],
+            "years": meta["years_of_experience"],
+            "location": meta["location"],
             "candidate_uuid": uuid.uuid5(uuid.NAMESPACE_DNS, relative_path),
             "chunks": chunk_resume(cv_text),
         }
@@ -347,6 +362,8 @@ def main():
     save_index_state(STATE_FILE_PATH, state)
     if HYBRID_RETRIEVAL and encoder.is_fitted:
         encoder.save(BM25_STATE_PATH)
+    metadata.save_cache()
+    metadata.log_summary()
 
     logger.info(
         f"Pipeline complete. Indexed: {updated_files_count} | "
