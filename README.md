@@ -1,24 +1,65 @@
 # Shortlist
 
-> Two-stage resume screening: vector retrieval + LLM reranking, with a labelled evaluation harness (nDCG, recall@k, MRR).
+[![CI](https://github.com/aggamsingh/Shortlist/actions/workflows/ci.yml/badge.svg)](https://github.com/aggamsingh/Shortlist/actions/workflows/ci.yml)
 
-A CPU-only microservice that takes a job description and returns the best-matching candidates from a corpus of CVs, each with a relevance score and a one-line justification.
+> Two-stage resume screening: hybrid vector + keyword retrieval, then LLM
+> reranking — with a labelled evaluation harness measuring whether any of it
+> actually works.
 
-It is a two-stage retrieval system: fast vector search over chunked resumes narrows thousands of CVs to a shortlist, then an LLM reranks that shortlist against the full job description. Retrieval quality is measured, not asserted — see [Evaluation](#evaluation).
+Give it a job description, get back ranked candidates with a one-line reason for
+each. Runs on CPU, with no GPU and no external database service required.
+
+**What makes this more than a RAG demo:** every design decision here was
+measured rather than assumed, and the measurements repeatedly disagreed with the
+design. Heading-based chunking lost to a plain sliding window. The LLM reranker
+turned out to *hurt* on easy queries. The benchmark itself had a bug that
+flattered the results. All of that is documented below, including the numbers
+that are unflattering.
 
 ```
-CVs (PDF/DOCX) ──> parse ──> chunk ──> embed ──> Qdrant
-                                                   │
-job description ──> embed ──────> vector search ───┤ grouped by candidate
-                                                   ▼
-                                          shortlist (N distinct people)
-                                                   │
-                                                   ▼
-                                          LLM rerank (Gemini / Groq)
-                                                   │
-                                                   ▼
-                                       scored candidates + reasoning
+CVs (PDF/DOCX) ──> parse ──> chunk ──> embed ─┬─> dense vectors ─┐
+                                              └─> BM25 sparse ───┤
+                                                                 ▼
+                                                              Qdrant
+                                                                 │
+job description ──> embed ──────────────────> hybrid search ─────┤ RRF fusion,
+                                                                 │ grouped by
+                                                                 ▼ candidate
+                                                    shortlist (N distinct people)
+                                                                 │
+                                                                 ▼
+                                                    LLM rerank (Groq / Gemini)
+                                                                 │
+                                                                 ▼
+                                                  scored candidates + reasoning
 ```
+
+### Headline results
+
+Measured on 32 labelled CVs and 15 job descriptions. The **within-role** set is
+the one that matters: every strong candidate there is a Python backend engineer
+and the job turns on a single requirement, so keyword overlap carries no signal.
+
+| | recall@5 | nDCG@5 |
+|---|---|---|
+| dense vectors only | 0.648 | 0.677 |
+| **+ hybrid BM25 retrieval** | **0.814** | **0.833** |
+| + LLM reranking | 0.843 | 0.865 |
+
+Hybrid retrieval is the large win. Reranking adds little here — and actively
+hurts on easy queries — which is itself the most interesting finding in the
+project. See [Reranker evaluation](#reranker-evaluation).
+
+### Contents
+
+- [Quick start](#quick-start) — running it in about two minutes, no Docker needed
+- [How it works](#how-it-works) — the pipeline, stage by stage
+- [Design decisions](#design-decisions) — what was chosen and what it cost
+- [Evaluation](#evaluation) — the benchmark, the results, and the bug in it
+- [Testing](#testing) — 182 tests and why the original 32 were worthless
+- [Configuration](#configuration) — every environment variable
+- [Limitations](#limitations) — what this does not do, stated plainly
+- [Next steps](#next-steps)
 
 ---
 
@@ -77,7 +118,23 @@ docker compose run indexer    # index whatever is in CV_FOLDER_PATH
 
 A naive top-N chunk search returns *chunks*, and one verbose CV can occupy many of the N slots. The reranker then gets a handful of people instead of N, and a candidate that vector search ranked 8th never gets the chance to be promoted.
 
-Qdrant's `query_points_groups` groups hits by `candidate_id`, guaranteeing N **distinct** candidates while still surfacing each one's best-matching chunks. On the within-role query set, this raises the share of relevant candidates that reach the reranker from **0.617 to 0.822** at the same retrieval budget. That number is the ceiling on final quality: a reranker can reorder what it is given, but it can never recover a candidate retrieval dropped.
+Qdrant's `query_points_groups` groups hits by `candidate_id`, guaranteeing N
+**distinct** candidates while still surfacing each one's best-matching chunks.
+
+**How much this is worth depends entirely on chunks per candidate**, and being
+precise about that matters more than the headline. With section chunking (~9
+chunks per CV) it lifts pool recall from **0.807 to 0.867**, because a few
+verbose CVs would otherwise monopolise the budget. With the window chunking this
+project ships (2 chunks per CV) flat retrieval already returns nearly distinct
+candidates, and grouping changes the metrics **not at all** — it converts a
+property that happened to hold into one that is guaranteed.
+
+An earlier version of this README claimed a much larger gain (0.617 → 0.822).
+That came from the original short-fixture corpus and does not survive on
+realistic-length CVs.
+
+Pool recall matters because it is the ceiling on final quality: a reranker can
+reorder what it is handed, but can never recover a candidate retrieval dropped.
 
 ### Retrieval is hybrid: dense embeddings fused with BM25
 
@@ -93,9 +150,20 @@ queries turn on. BM25 is strong there and weak at paraphrase, so the two are
 complementary. Both branches are queried and fused with Qdrant's native
 Reciprocal Rank Fusion, still grouped by candidate.
 
-Measured effect on the within-role set: **pool recall 0.822 → 0.933**, and
-nDCG@5 0.566 → 0.702 on whole-CV chunking. A regression test asserts the sparse
-branch still surfaces an exact term match that dense search ranks last.
+Measured effect on the within-role set, dense-only versus hybrid at the same
+retrieval budget:
+
+| | dense only | hybrid | |
+|---|---|---|---|
+| recall@5 | 0.648 | **0.814** | +0.17 |
+| nDCG@5 | 0.677 | **0.833** | +0.16 |
+| pool recall | 0.900 | 0.900 | unchanged |
+
+The unchanged pool recall is the informative part. **Hybrid retrieval is not
+finding different candidates — it is ordering the same pool far better.** Both
+strategies surface the same ~90% of relevant people within a budget of 10; BM25
+decides which of them land in the top 5. A regression test asserts the sparse
+branch still promotes an exact term match that dense search ranks last.
 
 Document weights carry term-frequency saturation and query weights carry IDF, so
 their dot product is the BM25 score. Token ids come from CRC32 rather than a
@@ -233,81 +301,86 @@ did not, and the corrected ones are above.
 
 **Caveat, stated plainly:** 3 within-role queries over 32 CVs is still a small sample, and differences of 0.03 nDCG remain inside the noise a single query could produce. The chunking and hybrid conclusions are held with more confidence than that margin because they are consistent in direction across every retrieval mode and both query sets, not because any single figure is decisive. The fixtures are now 255–304 words with three layout variants — realistic enough for chunking strategies to differ, still shorter than a real 400–800 word CV.
 
-### Reranker evaluation — measured
+### Reranker evaluation
 
-Every number in the table above is LLM-free. Adding the reranker on top of
-`section + grouped` gives, over **5 runs** at `temperature=0`
-(Groq, `openai/gpt-oss-120b`):
+Everything above is LLM-free. Adding the reranker on top of the shipped
+configuration (window + hybrid, 15 queries, Groq `openai/gpt-oss-120b`,
+`temperature=0`):
 
-These figures were taken with `section + grouped` retrieval, before hybrid
-search was added.
-
-**Within-role queries — the discriminating set**
-
-| metric | retrieval only | + LLM rerank | change |
+| | retrieval only | + reranking | |
 |---|---|---|---|
-| recall@5 | 0.494 | 0.739 – 0.822 (mean 0.805) | **+0.31** |
-| precision@5 | 0.467 | 0.733 – 0.800 (mean 0.787) | **+0.32** |
-| nDCG@5 | 0.605 | 0.855 – 0.886 (mean 0.877) | **+0.27** |
-| MRR | 0.833 | 1.000 (all 5 runs) | +0.17 |
-| pool recall | 0.822 | 0.822 (unchanged) | — |
+| **Cross-role** (the easy set) | | | |
+| recall@5 | 0.919 | 0.863 | **worse** |
+| precision@5 | 0.450 | 0.400 | **worse** |
+| nDCG@5 | 0.958 | 0.922 | **worse** |
+| MRR | 1.000 | 1.000 | — |
+| **Within-role** (the hard set) | | | |
+| recall@5 | 0.814 | 0.843 | better |
+| precision@5 | 0.743 | 0.771 | better |
+| nDCG@5 | 0.833 | 0.865 | better |
+| MRR | 0.905 | 0.905 | — |
 
-**Cross-role queries**
+**Reranking helps on hard queries and hurts on easy ones.** That is the most
+useful result in the project, and it is not a subtle effect.
 
-| metric | retrieval only | + LLM rerank | change |
-|---|---|---|---|
-| recall@5 | 0.830 | 0.763 (all 5 runs) | **−0.07** |
-| precision@5 | 0.560 | 0.520 (all 5 runs) | **−0.04** |
-| nDCG@5 | 0.799 | 0.887 – 0.899 (mean 0.895) | +0.10 |
-| MRR | 0.800 | 1.000 (all 5 runs) | +0.20 |
+On cross-role queries retrieval already scores 0.958. A React CV and a
+Kubernetes CV are trivially different, so there is nothing left for the LLM to
+fix and every judgement it makes is another chance to be wrong about something
+already correct. On within-role queries retrieval scores 0.833 — sixteen Python
+backend engineers where the job turns on one requirement — and there the LLM
+reads that requirement properly.
 
-**What this shows:**
+**The implication is a real optimisation, not just an observation.** Reranking
+costs ~1.5 s and an API call on *every* request, including the ones it makes
+slightly worse. A confidence gate — skip the LLM when the top retrieval score is
+clearly separated from the rest — would cut both latency and spend on exactly
+the queries where reranking is not earning its cost. That is the next thing this
+project should do.
 
-1. **Reranking is the single largest quality lever on the hard set** — +0.27 nDCG,
-   and MRR reaches a perfect 1.000 in every run, meaning the top result was
-   always relevant. The embedding model does see the discriminating requirement;
-   it just does not weight it heavily enough, and the LLM does.
-2. **Retrieval is now the bottleneck, not ranking.** Within-role recall@5 reaches
-   0.822 in 4 of 5 runs — exactly the pool recall. The reranker pulled *every*
-   relevant candidate retrieval handed it into the top 5. Further gains have to
-   come from retrieving better, not ranking better, which is precisely what the
-   grouped-retrieval change was for.
-3. **Cross-role recall and precision get worse.** This is a real trade-off, not a
-   bug. The reranker promotes strong (grade-2) matches and pushes partial
-   (grade-1) ones out of the top 5. Graded nDCG rewards that; binary recall@5
-   (which counts grade ≥ 1) penalises it. Both numbers are true — they measure
-   different things, and a system tuned for "shortlist the best" will look worse
-   on "find everyone plausible".
-4. **`temperature=0` is not fully deterministic.** Hosted inference still varies
-   run to run, which is why ranges over 5 runs are reported rather than a single
-   figure. Within-role nDCG moved ±0.03; cross-role recall and precision were
-   identical in all 5.
+#### The reranker's value shrank as retrieval improved
 
-**On the current corpus and the shipped configuration** (window + hybrid, 15
-queries), one mostly-clean run measured within-role nDCG@5 **0.865** against a
-retrieval-only baseline of **0.833** — a lift of about **+0.03**.
+An earlier measurement put the within-role lift at **+0.27 nDCG**. It is now
+**+0.03**. Nothing regressed; retrieval got better.
 
-That is far smaller than the +0.27 measured earlier, and the reason is the
-point: **the reranker's value depends on how weak retrieval is.** When retrieval
-scored 0.605, the LLM had a great deal to fix. Now that hybrid retrieval scores
-0.833, most of what the reranker used to contribute has already been done
-upstream, more cheaply and without an API call. Improving retrieval did not just
-raise the ceiling — it ate the reranker's margin.
+| | retrieval nDCG@5 | reranker lift |
+|---|---|---|
+| section chunking, dense-only, 8 queries | 0.605 | +0.27 |
+| window chunking, hybrid, 15 queries | 0.833 | +0.03 |
 
-Treat this as one observation, not a range. 13 of 15 queries were reranked in
-that run; the other two hit the daily token quota and fell back.
+When retrieval scored 0.605 the LLM had a great deal to fix. Now most of that
+work happens upstream — cheaper, faster, and with no API call. **Improving stage
+one did not compound with stage two; it ate its margin.** The value of an
+expensive reranker is a function of how weak the cheap stage is, which is worth
+knowing before committing to one architecturally.
 
-Repeating it has not yet been possible. A full rerank pass costs roughly 55,000
-tokens, so the Groq free tier's 200,000/day allows about three — and the
-ablation sweeps consumed the budget before a clean repeat could be taken. Every
-later attempt degraded to vector fallback.
+#### What the recall drop does and does not mean
 
-Because a fully degraded run prints numbers that look exactly like a result, the
+Cross-role recall@5 falls because the reranker promotes strong (grade 2) matches
+above partial (grade 1) ones, and recall@5 counts both as merely "relevant".
+Graded nDCG rewards that reordering; binary recall punishes it.
+
+The demoted candidates are **not discarded** — they move below the k=5 cutoff and
+reappear at a higher `top_k`. Whether the behaviour is correct depends on the
+task: for a shortlist of the best few to interview it is what you want, for a
+longlist of everyone worth a look it is not.
+
+#### Confidence in these numbers
+
+One mostly-clean run: 13 of 15 queries were reranked, the other two hit the
+daily token quota and fell back. **Treat it as a single observation, not a
+range.**
+
+Repeating it has not been possible. A full rerank pass costs roughly 55,000
+tokens and the Groq free tier allows 200,000/day, so about three runs — and the
+ablation sweeps consumed the budget before a clean repeat could be taken.
+
+Because a fully degraded run prints numbers shaped exactly like a result, the
 harness now labels them: a row reading `!! 7/7 NOT reranked` is retrieval-only
-output, not a reranker measurement. That guard exists because these runs were
-briefly mistaken for data.
+output. That guard exists because such runs were briefly mistaken for data.
 
-**Measured latency** (3 live API requests, 3 candidates each):
+#### Latency
+
+Measured over live API requests with 3 candidates:
 
 | stage | time |
 |---|---|
@@ -316,9 +389,9 @@ briefly mistaken for data.
 | **rerank** | **1505 – 2113 ms** |
 | total | 1.5 – 2.2 s |
 
-The LLM call is ~97% of request time. Retrieval is effectively free; any latency
-work belongs at the reranking stage (batching, a smaller model, or reranking
-only the top slice of the shortlist).
+The LLM is ~97% of request time; retrieval is effectively free. Any latency work
+belongs at the reranking stage — and per the table above, the cheapest win is
+not doing it at all when retrieval is already confident.
 
 ### Reproducing this
 
