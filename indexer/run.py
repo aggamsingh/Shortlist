@@ -186,6 +186,26 @@ def main():
     state = load_index_state(STATE_FILE_PATH)
     logger.info(f"Loaded index state. Tracks {len(state)} files.")
 
+    # The state file records what was indexed; the database holds it. Those can
+    # diverge -- switching between embedded and server Qdrant, wiping a volume
+    # while ./data survives, restoring a backup, or changing QDRANT_COLLECTION.
+    # When they do, every file looks "unchanged", nothing is written, and the run
+    # reports success over an empty index. Cheap guard: one count.
+    if state:
+        try:
+            indexed_points = qdrant_client.count(
+                collection_name=QDRANT_COLLECTION, exact=True
+            ).count
+            if indexed_points == 0:
+                logger.warning(
+                    f"Index state tracks {len(state)} files but the collection "
+                    f"'{QDRANT_COLLECTION}' is empty. The database and the state "
+                    "file have diverged; re-indexing everything."
+                )
+                state = {}
+        except Exception as e:
+            logger.warning(f"Could not verify collection contents ({e}); trusting index state.")
+
     # 5. Scan files in CV_FOLDER_PATH
     if not os.path.exists(CV_FOLDER_PATH):
         logger.warning(f"CV Folder path '{CV_FOLDER_PATH}' does not exist on host. Creating it.")
