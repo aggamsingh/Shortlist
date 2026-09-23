@@ -3,6 +3,7 @@ import os
 import re
 import time
 
+from indexer.llm import LLMClient, is_placeholder
 from indexer.utils import get_logger
 
 logger = get_logger("api.reranker")
@@ -125,15 +126,9 @@ class CVReranker:
                 "Screening will fall back to vector-similarity ranking."
             )
 
-        self._groq_client = None
-        self._genai = None
+        self._client = None
 
-    @staticmethod
-    def _is_placeholder(value: str) -> bool:
-        """.env.example ships dummy values; treat them as unconfigured."""
-        if not value or not value.strip():
-            return True
-        return value.strip().lower().startswith("your_")
+    _is_placeholder = staticmethod(is_placeholder)
 
     @property
     def is_configured(self) -> bool:
@@ -141,20 +136,18 @@ class CVReranker:
 
     # ---- provider clients (imported lazily so the SDKs stay optional) ----
 
-    def _get_groq(self):
-        if self._groq_client is None:
-            from groq import Groq
-
-            self._groq_client = Groq(api_key=self.groq_key)
-        return self._groq_client
-
-    def _get_genai(self):
-        if self._genai is None:
-            import google.generativeai as genai
-
-            genai.configure(api_key=self.gemini_key)
-            self._genai = genai
-        return self._genai
+    @property
+    def _llm(self):
+        """Shared transport: provider selection, retry policy, JSON parsing."""
+        if self._client is None:
+            self._client = LLMClient()
+            # Honour any keys/models overridden on this instance (tests do this).
+            self._client.gemini_key = self.gemini_key
+            self._client.groq_key = self.groq_key
+            self._client.gemini_model = self.gemini_model
+            self._client.groq_model = self.groq_model
+            self._client.max_retries = self.max_retries
+        return self._client
 
     # ---- prompt ----
 
@@ -198,40 +191,26 @@ class CVReranker:
     # ---- providers ----
 
     def _rerank_with_gemini(self, jd: str, candidates: list[dict]) -> list[dict]:
-        genai = self._get_genai()
-        model = genai.GenerativeModel(self.gemini_model)
         logger.info(f"Reranking {len(candidates)} candidates via Gemini ({self.gemini_model}).")
-        response = model.generate_content(
-            self._build_prompt(jd, candidates),
-            generation_config={
-                "response_mime_type": "application/json",
-                "temperature": 0,
-            },
+        payload = self._llm._with_retry(
+            self._llm._call_gemini, self._build_prompt(jd, candidates), "Gemini"
         )
-        return self._parse_rankings(response.text, "Gemini")
+        return self._rankings_from(payload, "Gemini")
 
     def _rerank_with_groq(self, jd: str, candidates: list[dict]) -> list[dict]:
-        client = self._get_groq()
         logger.info(f"Reranking {len(candidates)} candidates via Groq ({self.groq_model}).")
-        completion = client.chat.completions.create(
-            model=self.groq_model,
-            messages=[{"role": "user", "content": self._build_prompt(jd, candidates)}],
-            response_format={"type": "json_object"},
-            # Ranking should be reproducible: the same shortlist and JD must give
-            # the same order twice, or the evaluation measures sampling noise.
-            temperature=0,
+        payload = self._llm._with_retry(
+            self._llm._call_groq, self._build_prompt(jd, candidates), "Groq"
         )
-        return self._parse_rankings(completion.choices[0].message.content, "Groq")
+        return self._rankings_from(payload, "Groq")
 
     @staticmethod
-    def _parse_rankings(raw_text: str, provider: str) -> list[dict]:
-        """Parse the provider's JSON body into a list of ranking dicts."""
-        try:
-            payload = json.loads(raw_text)
-        except (TypeError, ValueError) as e:
-            raise RuntimeError(f"{provider} returned invalid JSON: {e}") from e
+    def _rankings_from(payload, provider: str) -> list[dict]:
+        """Pull the rankings array out of an already-parsed provider response.
 
-        # Accept a bare list as well as the documented {"rankings": [...]}.
+        Accepts a bare list as well as the documented {"rankings": [...]}, and
+        any single list-valued key, because models rename the wrapper.
+        """
         if isinstance(payload, list):
             rankings = payload
         elif isinstance(payload, dict):
@@ -247,6 +226,15 @@ class CVReranker:
         if not isinstance(rankings, list):
             raise RuntimeError(f"{provider} JSON contained no rankings array.")
         return [r for r in rankings if isinstance(r, dict)]
+
+    @classmethod
+    def _parse_rankings(cls, raw_text: str, provider: str) -> list[dict]:
+        """Parse a raw provider body into a list of ranking dicts."""
+        try:
+            payload = json.loads(raw_text)
+        except (TypeError, ValueError) as e:
+            raise RuntimeError(f"{provider} returned invalid JSON: {e}") from e
+        return cls._rankings_from(payload, provider)
 
     # ---- public API ----
 
