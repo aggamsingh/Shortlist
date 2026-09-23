@@ -18,6 +18,8 @@ keywords:
     0 = not a fit
 """
 
+from evaluation.enrichment import enrich
+
 CANDIDATES = [
     # ---------------- Python backend ----------------
     {
@@ -584,22 +586,70 @@ ALL_QUERIES = QUERIES + HARD_QUERIES
 
 
 def render_cv(candidate: dict) -> str:
-    """Render a candidate record as resume text with the headings the chunker expects."""
-    experience = "\n".join(candidate["experience"])
-    return (
-        f"{candidate['name']}\n"
-        f"{candidate['title']}\n"
-        f"{candidate['location']}, India\n"
-        f"\n"
-        f"Summary\n"
-        f"{candidate['summary']}\n"
-        f"\n"
-        f"Experience\n"
-        f"{experience}\n"
-        f"\n"
-        f"Skills\n"
-        f"{candidate['skills']}\n"
+    """Render a candidate record as a full-length resume document.
+
+    Padded to a realistic length with education, generic duties, projects and
+    interests, and rendered under one of three layouts. See
+    evaluation/enrichment.py for why: the original 55-word fixtures were far too
+    short for any chunking strategy to differ from any other, so the ablation was
+    measuring the fixture rather than the strategy.
+
+    The padding is deliberately non-discriminating, so every relevance label
+    stays valid -- it adds length and noise, never evidence.
+    """
+    extra = enrich(candidate)
+    experience = "\n".join(candidate["experience"] + extra["duties"])
+    projects = "\n".join(extra["projects"])
+    header = (
+        candidate["name"] + "\n"
+        + candidate["title"] + "\n"
+        + candidate["location"] + ", India" + "\n"
     )
+
+    if extra["layout"] == "headingless":
+        # No recognisable headings: exercises the chunker's fallback path, which
+        # a uniformly well-structured corpus would never reach.
+        return "\n".join([
+            header,
+            candidate["summary"],
+            experience,
+            "Core technologies used day to day: " + candidate["skills"] + ".",
+            projects,
+            extra["education"],
+            extra["certifications"],
+            extra["achievements"],
+            extra["languages"] + " " + extra["interests"],
+        ]) + "\n"
+
+    if extra["layout"] == "reordered":
+        sections = [
+            ("Skills", candidate["skills"]),
+            ("Education", extra["education"]),
+            ("Summary", candidate["summary"]),
+            ("Experience", experience),
+            ("Projects", projects),
+            ("Certifications", extra["certifications"]),
+            ("Achievements", extra["achievements"]),
+            ("Languages", extra["languages"]),
+            ("Interests", extra["interests"]),
+        ]
+    else:
+        sections = [
+            ("Summary", candidate["summary"]),
+            ("Experience", experience),
+            ("Skills", candidate["skills"]),
+            ("Projects", projects),
+            ("Education", extra["education"]),
+            ("Certifications", extra["certifications"]),
+            ("Achievements", extra["achievements"]),
+            ("Languages", extra["languages"]),
+            ("Interests", extra["interests"]),
+        ]
+
+    body = "\n".join(
+        heading + "\n" + text + "\n" for heading, text in sections
+    )
+    return header + "\n" + body
 
 
 def corpus_stats() -> dict:

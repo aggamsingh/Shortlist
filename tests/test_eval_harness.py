@@ -48,7 +48,36 @@ class EvalHarnessTest(unittest.TestCase):
         shutil.rmtree(cls.tmp, ignore_errors=True)
 
     def test_index_covers_every_candidate(self):
-        self.assertEqual(self.n_chunks, 4 * len(CANDIDATES))
+        """Every candidate must be represented, with no empty chunks.
+
+        This deliberately does not assert a fixed chunk count. The previous
+        version asserted exactly four chunks per CV, which only held because the
+        fixtures were uniform 55-word documents -- the very property that made
+        the chunking ablation meaningless. Pinning the count would re-freeze it.
+        """
+        points, _ = self.client.scroll(
+            collection_name=run_eval.COLLECTION, limit=1000, with_payload=True
+        )
+        indexed = {p.payload["candidate_id"] for p in points}
+        self.assertEqual(indexed, {c["id"] for c in CANDIDATES})
+        self.assertGreaterEqual(self.n_chunks, len(CANDIDATES))
+        self.assertTrue(all(p.payload["chunk_text"].strip() for p in points))
+
+    def test_fixtures_are_not_uniform(self):
+        """Guards the corpus property the chunking ablation depends on.
+
+        If every CV chunks identically, every strategy scores identically and the
+        comparison measures nothing. Realistic length and varied layout are what
+        make the ablation informative, so a regression here is worth failing on.
+        """
+        from evaluation.corpus import render_cv
+        from indexer.parser import chunk_cv
+
+        lengths = [len(render_cv(c).split()) for c in CANDIDATES]
+        self.assertGreater(min(lengths), 150, "CVs are too short to chunk meaningfully")
+
+        counts = {len(chunk_cv(render_cv(c))) for c in CANDIDATES}
+        self.assertGreater(len(counts), 1, "every CV chunks identically")
 
     def test_grouped_retrieval_returns_distinct_candidates(self):
         vector = self.embedder.embed_text(QUERIES[0]["job_description"])
