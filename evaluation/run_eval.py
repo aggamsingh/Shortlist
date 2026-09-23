@@ -216,6 +216,7 @@ def evaluate_config(client, embedder, retriever_name: str, budget: int, k: int,
     retrieve = RETRIEVERS[retriever_name]
     queries = QUERIES if queries is None else queries
     per_query, distinct_counts = [], []
+    degraded = 0
 
     for query in queries:
         vector = embedder.embed_text(query["job_description"])
@@ -242,6 +243,14 @@ def evaluate_config(client, embedder, retriever_name: str, budget: int, k: int,
             ]
             reranked = reranker.rerank(query["job_description"], candidates, top_k=len(candidates))
             ranked_ids = [r["candidate_id"] for r in reranked]
+            # A rerank that silently degraded to vector scores must not be
+            # reported as a reranker result. Every candidate carrying the
+            # fallback reasoning means the provider never answered.
+            if reranked and all(
+                "not scored by reranker" in r.get("match_reasoning", "")
+                for r in reranked
+            ):
+                degraded += 1
 
         metrics = evaluate_query(ranked_ids, query["relevance"], k=k)
         # Recall over the ENTIRE retrieved pool, not just the top k. In a two
@@ -256,10 +265,17 @@ def evaluate_config(client, embedder, retriever_name: str, budget: int, k: int,
 
     result = aggregate(per_query)
     result["avg_candidates_retrieved"] = sum(distinct_counts) / len(distinct_counts)
+    result["queries"] = len(queries)
+    result["degraded_queries"] = degraded
     return result
 
 
 def format_row(label: str, metrics: dict, k: int) -> str:
+    # Flag runs where the reranker never actually answered, so a degraded run
+    # cannot be mistaken for a measurement.
+    degraded = metrics.get("degraded_queries", 0)
+    if degraded:
+        label = f"{label}  !! {degraded}/{metrics.get('queries', '?')} NOT reranked"
     return (
         f"  {label:<34} "
         f"{metrics[f'recall@{k}']:.3f}   "

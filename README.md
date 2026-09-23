@@ -295,9 +295,17 @@ upstream, more cheaply and without an API call. Improving retrieval did not just
 raise the ceiling — it ate the reranker's margin.
 
 Treat this as one observation, not a range. 13 of 15 queries were reranked in
-that run; the other two hit the daily token quota and fell back. A full rerank
-pass costs roughly 55,000 tokens, so the Groq free tier's 200,000/day allows
-about three runs. Repeating this on a fresh quota is the top open item.
+that run; the other two hit the daily token quota and fell back.
+
+Repeating it has not yet been possible. A full rerank pass costs roughly 55,000
+tokens, so the Groq free tier's 200,000/day allows about three — and the
+ablation sweeps consumed the budget before a clean repeat could be taken. Every
+later attempt degraded to vector fallback.
+
+Because a fully degraded run prints numbers that look exactly like a result, the
+harness now labels them: a row reading `!! 7/7 NOT reranked` is retrieval-only
+output, not a reranker measurement. That guard exists because these runs were
+briefly mistaken for data.
 
 **Measured latency** (3 live API requests, 3 candidates each):
 
