@@ -199,6 +199,80 @@ class MergeTest(unittest.TestCase):
         self.assertIsInstance(out[0]["match_reasoning"], str)
 
 
+class RequestSizeTest(unittest.TestCase):
+    """Oversized requests must be split, not dropped and not retried.
+
+    Found running 32 real CVs through the service: 30 candidates at 1200 chars
+    built a ~8300-token prompt against Groq's 8000 TPM cap. The provider rejects
+    that outright (HTTP 413), and retrying cannot help because the request is
+    deterministically too large.
+    """
+
+    def _candidates(self, n, chars=1200):
+        return [{"candidate_id": f"c{i}", "name": f"P{i}", "cv_path": "",
+                 "score": 0.5, "resume_summary": "x " * (chars // 2)}
+                for i in range(n)]
+
+    def test_large_shortlist_is_split_into_batches(self):
+        reranker = CVReranker()
+        reranker.token_budget = 6000
+        batches = reranker._split_to_fit("jd", self._candidates(30))
+        self.assertGreater(len(batches), 1)
+        self.assertEqual(sum(len(b) for b in batches), 30, "candidates were dropped")
+
+    def test_every_batch_fits_the_budget(self):
+        reranker = CVReranker()
+        reranker.token_budget = 6000
+        for batch in reranker._split_to_fit("jd", self._candidates(30)):
+            estimated = len(reranker._build_prompt("jd", batch)) // 4
+            self.assertLessEqual(estimated, reranker.token_budget)
+
+    def test_small_shortlist_stays_one_batch(self):
+        reranker = CVReranker()
+        reranker.token_budget = 20000
+        self.assertEqual(len(reranker._split_to_fit("jd", self._candidates(3))), 1)
+
+    def test_edge_cases(self):
+        reranker = CVReranker()
+        self.assertEqual(reranker._split_to_fit("jd", []), [])
+        self.assertEqual(len(reranker._split_to_fit("jd", self._candidates(1))), 1)
+
+    def test_one_failing_batch_does_not_lose_the_others(self):
+        """A batch that errors must not discard judgements already obtained."""
+        reranker = CVReranker()
+        reranker.gemini_key = "stub"
+        reranker.token_budget = 2000
+        calls = {"n": 0}
+
+        def flaky(jd, batch):
+            calls["n"] += 1
+            if calls["n"] == 1:
+                raise RuntimeError("413 request too large")
+            return [{"candidate_id": c["candidate_id"], "score": 0.9,
+                     "match_reasoning": "judged"} for c in batch]
+
+        reranker._rerank_with_gemini = flaky
+        out = reranker.rerank("jd", self._candidates(10), top_k=10)
+        judged = [c for c in out if c["match_reasoning"] == "judged"]
+        self.assertGreater(len(judged), 0, "surviving batches lost their scores")
+        self.assertEqual(len(out), 10, "candidates disappeared")
+
+    def test_oversized_request_is_not_retried(self):
+        """413 is deterministic; retrying burns backoff and still fails."""
+        from indexer.llm import retry_delay
+
+        for message in ("Error code: 413 - Request too large for model",
+                        "please reduce your message size and try again"):
+            self.assertEqual(retry_delay(Exception(message), 0), 0.0, message)
+
+    def test_per_minute_rate_limit_is_still_retried(self):
+        from indexer.llm import retry_delay
+
+        self.assertGreater(
+            retry_delay(Exception("429 rate limit reached, try again in 3.5s"), 0), 0
+        )
+
+
 class RerankWithoutProviderTest(unittest.TestCase):
     """Behaviour when no usable provider is configured.
 

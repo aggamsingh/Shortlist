@@ -63,6 +63,36 @@ project. See [Reranker evaluation](#reranker-evaluation).
 
 ---
 
+## Try it on the evaluation corpus
+
+The 32 labelled CVs live as Python data in `evaluation/corpus.py`, so the service
+cannot read them directly. Export them as real `.docx` files and drive the whole
+pipeline by hand:
+
+```bash
+python -m evaluation.export_corpus --list   # see the 32 candidates and what each query expects
+python -m evaluation.export_corpus          # write them to ./cvs
+python -m indexer.run                       # index
+python -m uvicorn api.main:app --port 8000
+```
+
+Then search them:
+
+```bash
+curl -X POST http://localhost:8000/api/v1/screen   -H "X-API-Key: $API_KEY" -H "Content-Type: application/json"   -d '{"job_description":"Senior Python backend engineer. Must have production experience with a vector database and embedding-based semantic retrieval.","top_k":5}'
+```
+
+```
+0.95  Imran Qureshi      Built production RAG pipeline with Pinecone vector DB
+0.93  Ananya Rao         Designed semantic search backed by Qdrant
+0.92  Pooja Desai        Implemented semantic search using Weaviate
+0.75  Fatima Sheikh      embeddings and FAISS; no explicit vector DB ownership
+```
+
+`--messy-filenames` exports them as `cv_final_v2.docx` and similar, which forces
+the metadata extractor onto its LLM fallback instead of reading names from
+filenames.
+
 ## Quick start
 
 No Docker and no database server required — Qdrant can run embedded from a local directory.
@@ -202,6 +232,7 @@ LLM output is the least reliable input in the system, so `api/reranker.py` assum
 - **Reranked candidates are ordered ahead of fallbacks.** An LLM score and a cosine similarity are different units, so interleaving them by raw value would let an unjudged `0.6` cosine outrank a judged `0.55`.
 - **A provider outage degrades, it does not 500.** With no key or a failed call, the service returns vector-similarity ordering and says so in `match_reasoning`.
 - **Prompt size is capped** per candidate and per request, because concatenated chunks are otherwise unbounded input to a metered API.
+- **Oversized shortlists are split, not truncated.** Providers reject a request above their per-request token cap outright (HTTP 413), and retrying cannot help because the request is deterministically too large. Capping the candidate count instead would silently discard people retrieval worked to find, so the shortlist is batched to fit `LLM_TOKEN_BUDGET` and every candidate still gets judged. The trade-off is that scores are only strictly comparable within a batch, which is why fewer, larger batches are preferred. Found by running 32 real CVs: 30 candidates at 1200 chars built an ~8300-token prompt against an 8000-token cap.
 - **Rate limits are retried; quotas are not.** A per-minute cap clears in seconds, so it is worth waiting out with backoff. An exhausted daily quota reports a wait of minutes to hours, and sleeping through a short backoff for that only delays the inevitable fallback — so when a provider asks for longer than the retry ceiling, the request degrades immediately. A retired model id or a bad key never retries at all.
 
 ### Metadata extraction: cheap path first, LLM only on failure

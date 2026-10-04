@@ -119,6 +119,11 @@ class CVReranker:
         # Retries apply only to transient failures (rate limits, 5xx); a bad key
         # or a retired model id fails immediately rather than sleeping first.
         self.max_retries = max(0, int(os.getenv("LLM_MAX_RETRIES", "4")))
+        # Tokens allowed in a single rerank request. Groq's free tier caps a
+        # request at 8000 tokens per minute, and 30 candidates at 1200 chars each
+        # exceeds that -- which the provider rejects outright rather than
+        # queueing. Default leaves headroom for the prompt scaffolding.
+        self.token_budget = max(1000, int(os.getenv("LLM_TOKEN_BUDGET", "6000")))
 
         if not self.is_configured:
             logger.warning(
@@ -251,16 +256,61 @@ class CVReranker:
 
         rankings = []
         if self.is_configured:
-            try:
-                rankings = self._call_provider(jd, shortlist)
-            except Exception as e:
-                # A reranker outage should degrade the ordering, not 500 the request.
-                logger.error(f"LLM reranking failed ({e}); falling back to vector scores.")
-                rankings = []
+            batches = self._split_to_fit(jd, shortlist)
+            if len(batches) > 1:
+                logger.info(
+                    f"Shortlist exceeds the {self.token_budget}-token request budget; "
+                    f"reranking in {len(batches)} batches."
+                )
+            for batch in batches:
+                try:
+                    rankings.extend(self._call_provider(jd, batch))
+                except Exception as e:
+                    # A reranker outage degrades the ordering rather than failing
+                    # the request. Other batches still count: candidates the LLM
+                    # did judge keep their scores, the rest fall back.
+                    logger.error(
+                        f"LLM reranking failed for a batch of {len(batch)} "
+                        f"({e}); those candidates fall back to vector scores."
+                    )
         else:
             logger.info("No LLM configured; returning vector-similarity ranking.")
 
         return self._merge(shortlist, rankings, top_k)
+
+    def _split_to_fit(self, jd: str, candidates: list[dict]) -> list:
+        """Split the shortlist into batches that fit one request's token budget.
+
+        Providers reject an oversized request outright (HTTP 413), and no retry
+        can help: the request is deterministically too big. Capping the candidate
+        count instead would silently discard people the retrieval stage worked to
+        find, so the shortlist is split and every candidate still gets judged.
+
+        The trade-off is that scores are only strictly comparable within a batch.
+        A model shown ten strong candidates may calibrate differently from one
+        shown ten weak ones. Each candidate is still scored against the same job
+        description, so the effect is small, but it is why fewer, larger batches
+        are preferred over many small ones.
+        """
+        if not candidates:
+            return []
+
+        # ~4 characters per token is the usual rough ratio for English prose.
+        overhead = len(self._build_prompt(jd, [])) // 4
+        budget = max(self.token_budget - overhead, 500)
+
+        batches, current, current_tokens = [], [], 0
+        for candidate in candidates:
+            cost = len(truncate_text(candidate.get("resume_summary", ""), self.max_chars)) // 4
+            cost += 40  # id, name and the block scaffolding around the extract
+            if current and current_tokens + cost > budget:
+                batches.append(current)
+                current, current_tokens = [], 0
+            current.append(candidate)
+            current_tokens += cost
+        if current:
+            batches.append(current)
+        return batches
 
     @staticmethod
     def _retry_delay(error: Exception, attempt: int) -> float:

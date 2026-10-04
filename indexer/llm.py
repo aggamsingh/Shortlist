@@ -41,6 +41,15 @@ def retry_delay(error: Exception, attempt: int) -> float:
     backoff for that only delays the inevitable fallback.
     """
     text = str(error).lower()
+
+    # "Request too large" (413) is NOT transient even though providers report it
+    # with a rate_limit error code. A single request exceeding the per-minute
+    # token cap will exceed it again on every retry; the fix is a smaller
+    # request, so retrying just burns the backoff and degrades anyway.
+    if "request too large" in text or "413" in text or "reduce your message size" in text:
+        logger.info("Request exceeds the provider's per-request token cap; not retrying.")
+        return 0.0
+
     transient = any(
         marker in text
         for marker in ("rate limit", "rate_limit", "429", "timeout", "503", "502", "overloaded")
