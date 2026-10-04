@@ -13,10 +13,11 @@ each. Runs on CPU, with no GPU and no external database service required.
 measured rather than assumed, and the measurements repeatedly disagreed with the
 design. Heading-based chunking lost to a plain sliding window. The LLM reranker
 turned out to *hurt* on easy queries. The benchmark itself had a bug that
-flattered the results. And when a held-out query set was finally added, the
-headline score fell by 0.11 nDCG — the tuned numbers had been optimistic all
-along. All of that is documented below, including the numbers that are
-unflattering.
+flattered the results. A held-out query set, added late, knocked 0.08 nDCG off
+the headline — and then briefly suggested the shipped chunker was the wrong one,
+which turned out to be an 8-query fluctuation that a larger dev set reversed.
+All of that is documented below, including the numbers that are unflattering and
+the one conclusion that was deliberately *not* acted on.
 
 ```
 CVs (PDF/DOCX) ──> parse ──> chunk ──> embed ─┬─> dense vectors ─┐
@@ -38,34 +39,36 @@ job description ──> embed ────────────────�
 
 ### Headline results
 
-Measured on 32 labelled CVs and 32 job descriptions, split into **15 dev** and
-**17 held-out test** queries. The **within-role** set is the one that matters:
-every strong candidate there is a Python backend engineer and the job turns on a
-single requirement, so keyword overlap carries no signal.
+Measured on 32 labelled CVs and 54 labelled job descriptions, split into
+**37 dev** and **17 held-out test** queries. The **within-role** set is the one
+that matters: every strong candidate there is a Python backend engineer and the
+job turns on a single requirement, so keyword overlap carries no signal.
 
 Within-role, k=5, budget=10:
 
 | | dev recall@5 | dev nDCG@5 | **test** recall@5 | **test** nDCG@5 |
 |---|---|---|---|---|
-| dense vectors only | 0.648 | 0.677 | 0.402 | 0.502 |
-| **+ hybrid BM25 retrieval** | **0.814** | **0.833** | **0.594** | **0.725** |
-| + LLM reranking | 0.843 | 0.865 | not yet measured | not yet measured |
+| dense vectors only | 0.609 | 0.662 | 0.402 | 0.502 |
+| **+ hybrid BM25 retrieval** | **0.719** | **0.803** | **0.594** | **0.725** |
+| + LLM reranking | see below | see below | not yet measured | not yet measured |
 
-Two things to read off this table:
+Three things to read off this table:
 
-**Hybrid retrieval is the large win, and it generalises.** +0.16 nDCG on dev,
-+0.22 on queries that played no part in choosing it. This is the one conclusion
-the project holds with real confidence.
+**Hybrid retrieval is the large win, and it generalises.** +0.14 nDCG on dev,
++0.22 on queries that played no part in choosing it, and it wins under every
+chunking strategy on both splits. This is the one conclusion the project holds
+with real confidence.
 
-**The dev numbers were optimistic by about 0.11 nDCG.** The configuration was
-selected by looking at the dev queries, so reporting those same queries measured
-the tuning as much as the system. **0.725 is the honest within-role figure.** The
-gap is what test-set leakage costs, measured rather than hand-waved — see
+**0.725 is the honest within-role figure.** The configuration was selected by
+looking at the dev queries, so dev numbers measure the tuning as well as the
+system. The held-out set is what the system scores on job descriptions it was
+not shaped around — see
 [Held-out results](#held-out-results-the-honest-numbers).
 
-Reranking adds little on dev — and actively hurts on easy queries — which is
-itself the most interesting finding in the project. See
-[Reranker evaluation](#reranker-evaluation).
+**Reranking has never been measured on held-out queries.** Its dev lift was
++0.03 nDCG on an earlier, smaller dev set, and it actively *hurts* on easy
+queries. That is the most interesting finding in the project and also the least
+finished part of it. See [Reranker evaluation](#reranker-evaluation).
 
 ### Contents
 
@@ -73,7 +76,7 @@ itself the most interesting finding in the project. See
 - [How it works](#how-it-works) — the pipeline, stage by stage
 - [Design decisions](#design-decisions) — what was chosen and what it cost
 - [Evaluation](#evaluation) — the benchmark, the dev/test split, and the bug in it
-- [Testing](#testing) — 229 tests and why the original 32 were worthless
+- [Testing](#testing) — 230 tests and why the original 32 were worthless
 - [Configuration](#configuration) — every environment variable
 - [Limitations](#limitations) — what this does not do, stated plainly
 - [Next steps](#next-steps)
@@ -246,17 +249,23 @@ complementary. Both branches are queried and fused with Qdrant's native
 Reciprocal Rank Fusion, still grouped by candidate.
 
 Measured effect on the within-role set, dense-only versus hybrid at the same
-retrieval budget:
+retrieval budget, on both splits:
 
 | | dense only | hybrid | |
 |---|---|---|---|
-| recall@5 | 0.648 | **0.814** | +0.17 |
-| nDCG@5 | 0.677 | **0.833** | +0.16 |
-| pool recall | 0.900 | 0.900 | unchanged |
+| **dev** (17 queries) | | | |
+| recall@5 | 0.609 | **0.719** | +0.11 |
+| nDCG@5 | 0.662 | **0.803** | +0.14 |
+| pool recall | 0.854 | 0.869 | +0.02 |
+| **held-out** (8 queries) | | | |
+| recall@5 | 0.402 | **0.594** | +0.19 |
+| nDCG@5 | 0.502 | **0.725** | +0.22 |
+| pool recall | 0.783 | 0.829 | +0.05 |
 
-The unchanged pool recall is the informative part. **Hybrid retrieval is not
-finding different candidates — it is ordering the same pool far better.** Both
-strategies surface the same ~90% of relevant people within a budget of 10; BM25
+The barely-changed pool recall is the informative part. **Hybrid retrieval is
+not finding many different candidates — it is ordering much the same pool far
+better.** Both strategies surface a similar fraction of relevant people within a
+budget of 10; BM25
 decides which of them land in the top 5. A regression test asserts the sparse
 branch still promotes an exact term match that dense search ranks last.
 
@@ -327,7 +336,7 @@ Binding config at import time makes behaviour depend on whether `.env` loaded be
 
 ## Evaluation
 
-Retrieval quality is measured against a labelled synthetic corpus: **32 CVs, 32 job descriptions, graded relevance** (2 = would shortlist, 1 = plausible, 0 = not a fit).
+Retrieval quality is measured against a labelled synthetic corpus: **32 CVs, 54 job descriptions, graded relevance** (2 = would shortlist, 1 = plausible, 0 = not a fit).
 
 ```bash
 python -m evaluation.run_eval                # dev set, headline numbers
@@ -341,8 +350,8 @@ week, which is exactly how the leakage below happened the first time.
 
 Two query sets, because they measure very different things:
 
-- **Cross-role** (17 queries) — different jobs: backend, frontend, ML, DevOps, data engineering, QA, technical writing, cloud architecture, platform, accessibility, leadership. Any embedding model separates a React CV from a Kubernetes CV, so these saturate near the ceiling.
-- **Within-role** (15 queries) — jobs where *every* strong candidate is a Python backend engineer and only one specific requirement separates them: production vector-database experience, deep asyncio, owning your own infra, Django, query optimisation, lexical search, task queues, testing discipline, payments, WebSockets, consumer scale, legacy migration, hybrid search, batch-plus-light-API, seniority. Keyword overlap on "Python", "backend", "API" is near-uniform here and carries no signal. **This is the set that discriminates.**
+- **Cross-role** (29 queries) — different jobs: backend, frontend, ML, DevOps, data engineering, QA, technical writing, cloud architecture, platform engineering, accessibility, web performance, design systems, streaming, analytics engineering, monitoring, recommendations, LLM products, leadership. Any embedding model separates a React CV from a Kubernetes CV, so these saturate near the ceiling.
+- **Within-role** (25 queries) — jobs where *every* strong candidate is a Python backend engineer and only one specific requirement separates them: production vector-database experience, deep asyncio, owning your own infra, Django, query optimisation, lexical search, task queues, caching, ORM migrations, gRPC contracts, instrumentation, load testing, mentoring, MySQL modelling, retrieval evaluation, internal tooling, small-team breadth, testing discipline, payments, WebSockets, consumer scale, legacy migration, hybrid search, batch-plus-light-API, seniority. Keyword overlap on "Python", "backend", "API" is near-uniform here and carries no signal. **This is the set that discriminates.**
 
 A quarter of the corpus is deliberate distractors: a QA engineer whose CV is dense with Python, a technical writer who documents FastAPI, a Java engineer whose resume says "backend microservices Docker". A keyword matcher scores well without them. Two held-out queries deliberately invert dev labels — the ETL developer who was a *partial* match for the dev data-engineering query is the *strong* match for a warehousing query, and the vector-search specialists who win the dev vector query are the wrong answer for a lexical-search query. A system that has memorised "data means Spark" or "search means embeddings" gets both backwards.
 
@@ -357,7 +366,9 @@ upper bound of unknown tightness.
 Partitioning those 15 would not have fixed it: all of them had already
 influenced the configuration, so neither half was clean. The fix was to author
 17 new queries against the existing candidates **without looking at any
-retrieval output**, and hold them back. They also probe axes the dev set never
+retrieval output**, and hold them back. The dev set was then expanded to 37, so
+that design questions too small to settle on 15 queries could be settled there
+instead of on the held-out set. They also probe axes the dev set never
 touches — seniority, business domain, legacy modernisation, accessibility,
 testing discipline, and the *conjunction* of lexical and vector search — so they
 test generalisation to new kinds of job description rather than new wordings of
@@ -373,46 +384,69 @@ the matching test fails.
 
 ### Results on the dev set (retrieval only, k=5, budget=10)
 
-These are the numbers the configuration was **chosen** on, so read them as
-an upper bound. The held-out figures are in the next section.
+37 dev queries. These are the numbers the configuration was **chosen** on, so
+read them as an upper bound; the held-out figures follow.
 
 | configuration | recall@5 | nDCG@5 | pool recall |
 |---|---|---|---|
-| **Cross-role dev** (8 queries) | | | |
-| whole CV + grouped | 0.919 | 0.954 | 0.950 |
-| whole CV + hybrid | 0.919 | **0.967** | 0.919 |
-| window + grouped | 0.919 | 0.951 | 0.950 |
-| **window + hybrid** | 0.919 | 0.958 | 0.950 |
-| section + grouped | 0.894 | 0.902 | 0.975 |
-| section + hybrid | 0.894 | 0.927 | 0.975 |
-| **Within-role dev** (7 queries) | | | |
-| whole CV + flat | 0.648 | 0.677 | 0.900 |
-| whole CV + hybrid | 0.795 | 0.803 | 0.871 |
-| window + flat | 0.648 | 0.677 | 0.900 |
-| window + grouped | 0.648 | 0.677 | 0.900 |
-| **window + hybrid** | **0.814** | **0.833** | 0.900 |
-| window60 + hybrid | 0.743 | 0.756 | 0.924 |
-| section + flat | 0.638 | 0.647 | 0.807 |
-| section + grouped | 0.638 | 0.647 | 0.867 |
-| section + hybrid | 0.726 | 0.761 | 0.867 |
+| **Cross-role dev** (20 queries) | | | |
+| whole CV + grouped | 0.809 | 0.829 | 0.868 |
+| whole CV + hybrid | 0.863 | **0.895** | 0.938 |
+| window + grouped | 0.772 | 0.798 | 0.876 |
+| **window + hybrid** (shipped) | 0.847 | 0.890 | 0.909 |
+| window60 + hybrid | 0.863 | 0.870 | 0.930 |
+| section + grouped | 0.812 | 0.829 | 0.919 |
+| section + hybrid | 0.832 | 0.882 | **0.953** |
+| **Within-role dev** (17 queries) | | | |
+| whole CV + flat | 0.609 | 0.662 | 0.854 |
+| whole CV + hybrid | 0.662 | 0.758 | 0.842 |
+| window + flat | 0.609 | 0.662 | 0.854 |
+| window + grouped | 0.609 | 0.662 | 0.854 |
+| **window + hybrid** (shipped) | **0.719** | **0.803** | 0.869 |
+| window60 + flat | 0.543 | 0.593 | 0.751 |
+| window60 + hybrid | 0.701 | 0.759 | 0.861 |
+| section + flat | 0.551 | 0.557 | 0.750 |
+| section + grouped | 0.551 | 0.557 | 0.816 |
+| section + hybrid | 0.597 | 0.633 | 0.786 |
 
 **What this actually shows:**
 
-1. **Hybrid retrieval is the largest single win.** On the within-role set it lifts nDCG@5 from 0.677 to **0.833** and recall@5 from 0.648 to **0.814**. Exact technical tokens are where dense embeddings are weakest and BM25 is strongest.
+1. **Hybrid retrieval is the largest single win.** On the within-role set it
+   lifts nDCG@5 from 0.662 to **0.803** and recall@5 from 0.609 to **0.719**,
+   and it is the best choice under every chunker on both query sets. Exact
+   technical tokens are where dense embeddings are weakest and BM25 is
+   strongest, and the within-role queries turn on exactly those tokens.
 
-2. **Grouping's value depends on how many chunks each candidate has.** With section chunking (~9 chunks per CV) it lifts pool recall 0.807 → 0.867, because a few verbose CVs otherwise monopolise the budget. With the shipped window chunking (2 chunks per CV) flat retrieval already returns nearly distinct candidates, and grouping changes the metrics not at all — it only guarantees the property rather than leaving it to luck. An earlier, much larger figure for this came from the short-fixture corpus and no longer holds.
+2. **Chunk size is settled, and the shipped default wins.** The window scores
+   **0.803** within-role against 0.759 for `window60`, 0.758 for whole-CV and
+   0.633 for section chunking. This replaces an earlier, weaker version of this
+   result — see [How the chunking question was actually
+   settled](#how-the-chunking-question-was-actually-settled), which is the most
+   instructive sequence in the project.
 
-3. **The cross-role set is nearly useless as a benchmark.** It sits at 0.92 nDCG for almost every configuration. Reporting only these numbers would make the system look better than it is.
+3. **Grouping's value depends on how many chunks each candidate has.** With
+   section chunking (~9 chunks per CV) it lifts pool recall 0.750 → 0.816,
+   because a few verbose CVs otherwise monopolise the budget. With the shipped
+   window chunking (2 chunks per CV) flat retrieval already returns nearly
+   distinct candidates, and grouping barely moves the metrics — it guarantees
+   the property rather than leaving it to luck. It is also what keeps
+   `cands` at a full 10: under `flat`, section chunking delivers only 7.2
+   distinct people to the reranker instead of 10.
 
-4. **Retrieval still loses ~10% of relevant candidates.** Pool recall on the within-role set is 0.900, so about one relevant candidate in ten never reaches the reranker and can never be recovered. An earlier draft of this README claimed 1.000; that number was an artifact of the evaluation bug described below, and is corrected here.
+4. **The cross-role set is nearly useless as a benchmark.** It sits near 0.88
+   nDCG for almost every configuration. Reporting only these numbers would make
+   the system look considerably better than it is.
 
-5. **Section chunking lost, and the default changed because of it.** Heading-based sectioning was the original design and seemed principled. On the first corpus it was indistinguishable from a sliding window, because 55-word fixtures chunk identically under any strategy. Once the corpus was rebuilt at realistic length with varied layouts — including CVs with no headings at all — the window won consistently: within-role nDCG **0.833 vs 0.761**, cross-role **0.958 vs 0.927**, across every retrieval mode. The shipped default is now the window (`CHUNK_STRATEGY=section` restores the old behaviour). This is the one conclusion in the project that reversed under better data, which is the whole reason the corpus was rebuilt.
+5. **Retrieval still loses ~13% of relevant candidates.** Within-role pool
+   recall is 0.869, so roughly one relevant candidate in eight never reaches the
+   reranker and can never be recovered. An earlier draft of this README claimed
+   1.000; that was an artifact of the evaluation bug described below.
 
-   **This finding did not fully survive the held-out set.** Section chunking still loses on both splits, but the choice *among* the three surviving chunkers turned out to be noise, and the shipped window is not the held-out winner. See [Held-out results](#held-out-results-the-honest-numbers) — it is the clearest example in this project of a dev-set result that was over-read.
 
 ### Held-out results (the honest numbers)
 
-Run once, after the configuration was already fixed on dev. `--split test`.
+Measured once, with the configuration already fixed on dev. `--split test`.
+These numbers have never been used to choose anything.
 
 | configuration | recall@5 | nDCG@5 | pool recall |
 |---|---|---|---|
@@ -427,57 +461,87 @@ Run once, after the configuration was already fixed on dev. `--split test`.
 | whole CV + hybrid | 0.667 | 0.732 | 0.846 |
 | window + flat | 0.402 | 0.502 | 0.783 |
 | **window + hybrid** (shipped) | **0.594** | **0.725** | 0.829 |
-| window60 + hybrid | 0.588 | **0.775** | 0.798 |
+| window60 + hybrid | 0.588 | 0.775 | 0.798 |
 | section + hybrid | 0.558 | 0.652 | 0.723 |
 
-**Dev vs held-out, shipped configuration:**
+**Dev vs held-out, shipped configuration** (dev = 37 queries, test = 17):
 
 | | dev | test | gap |
 |---|---|---|---|
-| Cross-role recall@5 | 0.919 | 0.833 | −0.086 |
-| Cross-role nDCG@5 | 0.958 | 0.896 | −0.062 |
-| Cross-role pool recall | 0.950 | 0.833 | −0.117 |
-| Within-role recall@5 | 0.814 | 0.594 | −0.220 |
-| Within-role nDCG@5 | 0.833 | 0.725 | −0.108 |
-| Within-role pool recall | 0.900 | 0.829 | −0.071 |
+| Cross-role recall@5 | 0.847 | 0.833 | −0.014 |
+| Cross-role nDCG@5 | 0.890 | 0.896 | **+0.006** |
+| Cross-role pool recall | 0.909 | 0.833 | −0.076 |
+| Within-role recall@5 | 0.719 | 0.594 | −0.125 |
+| Within-role nDCG@5 | 0.803 | 0.725 | −0.078 |
+| Within-role pool recall | 0.869 | 0.829 | −0.040 |
 
-**What the held-out set changed, and what it did not:**
+**What the held-out set showed:**
 
-1. **The hybrid decision survived, and got stronger.** Within-role nDCG goes
-   0.502 → 0.725 with BM25 fusion on queries that had no part in choosing it:
-   **+0.22**, larger than the +0.16 measured on dev. Hybrid retrieval is the one
-   conclusion in this project that is held with real confidence, and it is the
-   one most worth keeping.
+1. **Hybrid retrieval generalises, and is the one result held with real
+   confidence.** Within-role nDCG goes 0.502 → 0.725 with BM25 fusion on
+   queries that had no part in choosing it: **+0.22**, larger than the +0.14 on
+   dev, and hybrid wins under every chunker on both splits. Direction,
+   magnitude and consistency all agree.
 
-2. **The chunking decision did not survive, and was over-fit.** On dev the
-   sliding window beat section chunking 0.833 to 0.761 and the default was
-   changed because of it. On held-out within-role queries the window scores
-   0.725 and `window60` scores **0.775** — the shipped default ranks *third of
-   four*. Section chunking still loses on both splits, so that half of the
-   conclusion holds; the choice *between* the three surviving chunkers was noise
-   dressed up as a finding.
+2. **Within-role performance is genuinely worse than dev suggests.** 0.725
+   against 0.803: a −0.078 nDCG gap, and −0.125 on recall@5. **0.725 is the
+   honest within-role number** and the one to quote. Some of that gap is
+   residual optimism from selecting on dev; some is simply that 8 queries over
+   32 CVs is a noisy estimate. It is not possible to separate the two with a
+   corpus this size, and this README does not pretend otherwise.
 
-   **The default has deliberately not been changed.** Switching to `window60`
-   because it won on the held-out set is precisely the mistake the split exists
-   to prevent — it would consume the only clean measurement available and put
-   the project back where it started. Chunk size is now an open question to be
-   settled on an expanded dev set, not a decision to flip on 8 queries.
+3. **Cross-role performance generalises essentially perfectly** — 0.890 dev
+   against 0.896 test. That is not a sign of a well-tuned system so much as
+   confirmation that the cross-role task is too easy to distinguish anything.
 
-3. **Retrieval, not reranking, is the ceiling.** Within-role pool recall is
-   0.829 on held-out queries: about one relevant candidate in six never reaches
-   the reranker at all, and no amount of reranking can recover them. Reranking
-   can only reorder the 0.829 it is handed.
+4. **Retrieval, not reranking, is the ceiling.** Within-role pool recall is
+   0.829 on held-out queries: roughly one relevant candidate in six never
+   reaches the reranker, and no amount of reranking recovers them. Stage two can
+   only reorder the 0.829 that stage one hands it.
 
-4. **Absolute scores are lower than every number previously reported here.**
-   Not because anything regressed — the dev figures reproduce exactly — but
-   because the earlier figures were measured on the queries used to tune. The
-   0.11 nDCG gap is the size of that effect on this project, measured.
+### How the chunking question was actually settled
 
-**Caveat:** 8 held-out within-role queries is a small sample, and a gap of 0.05
-nDCG between two chunkers is well inside what a single query can move. The
-direction of the hybrid result (+0.22, consistent across all four chunkers) is
-trustworthy; the ordering among the top chunkers is not. Expanding the dev set
-is the next item under [Next steps](#next-steps).
+This sequence is the most instructive thing in the project, so it is recorded in
+full rather than summarised into the answer.
+
+| stage | evidence | within-role nDCG | conclusion drawn |
+|---|---|---|---|
+| 1. Original design | none — it just seemed principled | — | section chunking ships |
+| 2. First benchmark | 32 CVs of ~55 words | identical | no difference detectable |
+| 3. Realistic corpus | 15 dev queries, 255–304 words | window 0.833, section 0.761 | **default changed to window** |
+| 4. Held-out set | 8 held-out queries | window 0.725, **window60 0.775** | window ranks *third of four* |
+| 5. Expanded dev set | 17 dev queries | **window 0.803**, window60 0.759 | window confirmed; stage 4 was noise |
+
+**At stage 4 the default was deliberately left alone.** `window60` had won the
+only clean measurement available, and the temptation was to switch. Switching
+would have been the exact mistake the split exists to prevent: it would have
+spent the held-out set on a decision and left nothing clean to check the result
+against. So the finding was recorded as *unresolved* and the dev set was
+expanded instead — from 15 queries to 37 — which is the only legitimate way to
+settle a question of that size.
+
+At stage 5, with more than twice the within-role queries, the window wins by
+0.044 over `window60` and the stage-4 ordering disappears. The held-out result
+was an 8-query fluctuation, and it is visible as such only because nothing was
+changed in response to it.
+
+Two things to take from this:
+
+- **A 0.05 nDCG difference on 8 queries is not a finding.** Three of the four
+  chunkers sat inside that band, and their ordering changed with the sample. The
+  hybrid result (+0.14 to +0.22, every chunker, both splits) is a different kind
+  of claim entirely, and only one of the two belongs in a summary.
+- **Section chunking is the one part that held throughout.** It loses on both
+  splits and under every retrieval mode, by a wide margin (0.633 vs 0.803 on the
+  expanded dev set). The shipped default remains the window;
+  `CHUNK_STRATEGY=section` restores the old behaviour.
+
+**Caveat, stated plainly:** 17 within-role dev queries over 32 CVs is still a
+small sample. The 0.044 gap between the window and `window60` is more credible
+than the stage-4 reversal it overturns, but it is not decisive, and if a future
+measurement moves it that would not be surprising. What *is* now well supported
+is the gap between either of them and section chunking.
+
 
 ### The benchmark had a bug that flattered it
 
@@ -502,13 +566,21 @@ Every number in this README was re-measured after the fix. The headline
 conclusions — hybrid wins, window beats section — survived; the specific figures
 did not, and the corrected ones are above.
 
-**Caveat, stated plainly:** 7 within-role dev queries over 32 CVs is still a small sample, and differences of 0.03 nDCG remain inside the noise a single query could produce. The chunking and hybrid conclusions are held with more confidence than that margin because they are consistent in direction across every retrieval mode and both query sets, not because any single figure is decisive. The fixtures are now 255–304 words with three layout variants — realistic enough for chunking strategies to differ, still shorter than a real 400–800 word CV.
+**On the fixtures:** they are 255–304 words with three layout variants, including CVs with no recognisable headings at all — realistic enough for chunking strategies to differ, still shorter than a real 400–800 word CV. The short 55-word originals are what made every chunking strategy look identical, which is why the corpus was rebuilt.
 
 ### Reranker evaluation
 
 Everything above is LLM-free. Adding the reranker on top of the shipped
-configuration (window + hybrid, the 15 **dev** queries, Groq `openai/gpt-oss-120b`,
-`temperature=0`):
+configuration (window + hybrid, Groq `openai/gpt-oss-120b`, `temperature=0`):
+
+> **Read this table with its date on it.** It was measured against the
+> **original 15-query dev set**, before the dev set was expanded to 37 and
+> before a held-out set existed. The retrieval baselines it is compared against
+> (0.958 and 0.833) are therefore the *old* dev figures, not the current ones.
+> The qualitative result — reranking helps on hard queries, hurts on easy ones —
+> is what this section is for; the exact deltas are stale and are not repeated
+> elsewhere in this README. Re-measuring it on the current splits is item 1
+> under [Next steps](#next-steps).
 
 | | retrieval only | + reranking | |
 |---|---|---|---|
@@ -526,10 +598,10 @@ configuration (window + hybrid, the 15 **dev** queries, Groq `openai/gpt-oss-120
 **Reranking helps on hard queries and hurts on easy ones.** That is the most
 useful result in the project, and it is not a subtle effect.
 
-On cross-role queries retrieval already scores 0.958. A React CV and a
+On cross-role queries retrieval already scored 0.958 on that set. A React CV and a
 Kubernetes CV are trivially different, so there is nothing left for the LLM to
 fix and every judgement it makes is another chance to be wrong about something
-already correct. On within-role queries retrieval scores 0.833 — sixteen Python
+already correct. On within-role queries retrieval scored 0.833 — sixteen Python
 backend engineers where the job turns on one requirement — and there the LLM
 reads that requirement properly.
 
@@ -627,7 +699,7 @@ invalid key, so you can tell the two apart immediately.
 ## Testing
 
 ```bash
-python -m unittest discover -s tests -t . -v      # 229 tests
+python -m unittest discover -s tests -t . -v      # 230 tests
 ```
 
 Qdrant runs embedded, so the end-to-end tests need no server and run in CI.
@@ -669,21 +741,27 @@ Known and deliberate, rather than hidden:
 - **No OCR.** Scanned image-only PDFs extract no text and are skipped with a warning.
 - **Reranker latency dominates and is not optimised.** Measured: embed 12–51 ms, retrieve 1.3–2.6 ms, rerank 1505–2113 ms — about 97% of request time, for only 3 candidates. It has not been measured with a full 30-candidate shortlist, and there is no batching, caching or timeout tuning.
 - **Model ids drift.** The Groq default is `openai/gpt-oss-120b`, verified working; the previous `llama-3.3-70b-versatile` now 404s. The Gemini default `gemini-2.5-flash` is **unverified** — no Gemini key was tested. Both are configurable via `GEMINI_MODEL` / `GROQ_MODEL`.
-- **Results are from one model on a small corpus.** The reranker numbers come from a single provider (Groq `openai/gpt-oss-120b`) over the 15 dev queries and 32 synthetic CVs, and the +0.03 lift rests on one mostly-clean run. They show the pipeline works and that retrieval quality erodes the reranker's margin; they are not a general claim about reranking.
-- **The reranker has never been measured on held-out queries.** Retrieval has; reranking has not. Its +0.03 dev lift was measured on the queries used to tune retrieval, and the dev-to-test gap on retrieval was 0.11 nDCG, so the reranker's true contribution is unknown rather than small.
-- **17 held-out queries is a thin test set.** It is enough to show a 0.22 nDCG effect and not enough to resolve a 0.05 one. Treat the chunker ordering in the held-out table as undetermined.
+- **Results are from one model on a small corpus.** The reranker numbers come from a single provider (Groq `openai/gpt-oss-120b`) over the *original* 15 dev queries and 32 synthetic CVs, and the +0.03 lift rests on one mostly-clean run. They show the pipeline works and that retrieval quality erodes the reranker's margin; they are not a general claim about reranking.
+- **The reranker has never been measured on held-out queries, or on the current dev set.** Retrieval has a clean held-out estimate; reranking has neither. Its +0.03 lift came from the original 15-query dev set, and retrieval has since been re-measured on 37 dev and 17 held-out queries. The reranker's true contribution is unknown rather than small.
+- **17 held-out queries is a thin test set.** It is enough to show a 0.22 nDCG effect and not enough to resolve a 0.05 one — as demonstrated when its 8 within-role queries ranked the shipped chunker third, and 17 dev queries then put it first. Treat the chunker ordering in the held-out table as noise, and single-digit differences anywhere in this README as undetermined.
+- **Relevance labels are author-assigned.** One person graded all 54 queries, with no second annotator and no inter-rater agreement measured. The grades encode a defensible reading of each role, not a consensus one.
 
 ## Next steps
 
 In rough priority order:
 
-1. **Grow the dev set to 50+ queries**, then settle chunk size properly. The
-   held-out run showed `window60` ahead of the shipped `window` on within-role
-   nDCG (0.775 vs 0.725), but 8 queries cannot resolve a gap that size and the
-   held-out set must not be used to pick. This is now the highest-value item,
-   because it unblocks a decision rather than just adding a number.
-2. **Measure the reranker on held-out queries.** Retrieval has a clean estimate
-   now; reranking does not. Its +0.03 was measured on tuning queries.
-3. Repeat the hybrid + reranker measurement across several runs, so the +0.03 lift is a range rather than a single observation.
-4. Measure metadata-extraction accuracy against a labelled set, rather than spot-checking it.
-5. Pin `qdrant-client` more tightly. The Docker build resolved 1.19.1 against a `~=1.18` pin; it works, but a loose pin is exactly what broke `.search()` before.
+1. **Re-measure the reranker on the current splits.** Retrieval now has a clean
+   held-out estimate; reranking does not have one at all. Its +0.03 lift was
+   measured on the original 15-query dev set, against retrieval baselines that
+   have since changed, so its real contribution is *unknown* rather than small.
+   This is the largest open question in the project.
+2. **Add a cross-encoder reranker** (`ms-marco-MiniLM-L-6-v2`) and compare three
+   ways — no reranking, cross-encoder, LLM — on nDCG, latency and cost. A local
+   cross-encoder costs no API call and ~30 ms rather than ~1.5 s, so if it
+   recovers most of the LLM's lift it is the better default.
+3. **Gate the reranker on retrieval confidence.** Reranking demonstrably hurts
+   on easy queries while costing 1.5 s and an API call on every request. Skip
+   the LLM when the top retrieval score is clearly separated from the rest.
+4. Repeat the reranker measurement across several runs, so the lift is a range rather than a single observation.
+5. Measure metadata-extraction accuracy against a labelled set, rather than spot-checking it.
+6. Pin `qdrant-client` more tightly. The Docker build resolved 1.19.1 against a `~=1.18` pin; it works, but a loose pin is exactly what broke `.search()` before.

@@ -571,6 +571,114 @@ QUERIES = [
         ),
         "relevance": {"c18": 2},
     },
+    # ------------------------------------------------------------------
+    # Dev set expansion.
+    #
+    # 15 dev queries could separate a 0.16 nDCG effect (hybrid) but not a 0.05
+    # one (chunk size), which left the shipped chunker chosen on noise. These
+    # add coverage without touching the held-out set.
+    # ------------------------------------------------------------------
+    {
+        "id": "q9_go_backend",
+        "job_description": (
+            "Backend Engineer with production Go experience. You will build "
+            "internal gRPC services and own the contracts between them."
+        ),
+        "relevance": {"c04": 2, "c12": 1},
+    },
+    {
+        "id": "q10_kafka_streaming",
+        "job_description": (
+            "Streaming Data Engineer to own our Kafka ingestion: event-driven "
+            "pipelines, exactly-once delivery and schema evolution on topics."
+        ),
+        # c18 is the trap: real Kafka event-driven integration experience, but a
+        # Java backend engineer rather than a data engineer.
+        "relevance": {"c14": 2, "c18": 1},
+    },
+    {
+        "id": "q11_iac_terraform",
+        "job_description": (
+            "Infrastructure Engineer to own our infrastructure as code. You will "
+            "write and refactor Terraform modules covering the whole AWS estate."
+        ),
+        "relevance": {"c11": 2, "c29": 1, "c13": 1, "c04": 1},
+    },
+    {
+        "id": "q12_design_systems",
+        "job_description": (
+            "Frontend Engineer to own our design system: a typed, reusable "
+            "component library that other product teams build against."
+        ),
+        "relevance": {"c05": 2, "c06": 1, "c07": 1},
+    },
+    {
+        "id": "q13_web_performance",
+        "job_description": (
+            "Frontend Performance Engineer. The work is measurable: Core Web "
+            "Vitals, bundle size, code splitting and render cost."
+        ),
+        "relevance": {"c05": 2, "c20": 2, "c06": 1},
+    },
+    {
+        "id": "q14_recsys",
+        "job_description": (
+            "Machine Learning Engineer for recommendations. You will build "
+            "ranking models and serve them online to a live product surface."
+        ),
+        "relevance": {"c19": 2, "c08": 1, "c09": 1},
+    },
+    {
+        "id": "q15_pytorch_training",
+        "job_description": (
+            "Machine Learning Engineer for training infrastructure: distributed "
+            "multi-GPU PyTorch jobs, experiment tracking and reproducibility."
+        ),
+        "relevance": {"c08": 2, "c10": 1},
+    },
+    {
+        "id": "q16_information_extraction",
+        "job_description": (
+            "NLP Engineer for information extraction. You will fine-tune "
+            "transformer models for named entity recognition over specialised "
+            "domain text and measure extraction quality."
+        ),
+        "relevance": {"c10": 2, "c08": 2},
+    },
+    {
+        "id": "q17_analytics_engineering",
+        "job_description": (
+            "Analytics Engineer to model data for the business: dbt "
+            "transformations on a Snowflake warehouse feeding BI dashboards."
+        ),
+        "relevance": {"c14": 2, "c15": 1, "c32": 1},
+    },
+    {
+        "id": "q18_monitoring",
+        "job_description": (
+            "Monitoring Engineer to own metrics and alerting: Prometheus, "
+            "Grafana dashboards and actionable alerts for containerised "
+            "workloads."
+        ),
+        "relevance": {"c12": 2, "c11": 1, "c29": 1, "c28": 1},
+    },
+    {
+        "id": "q19_e2e_testing",
+        "job_description": (
+            "Test Engineer for end-to-end browser automation. You will build and "
+            "maintain UI test suites and keep them green in the CI pipeline."
+        ),
+        "relevance": {"c16": 2, "c07": 2, "c06": 1},
+    },
+    {
+        "id": "q20_llm_product",
+        "job_description": (
+            "Engineer for LLM-backed product features: prompt orchestration, "
+            "retrieval augmented generation and shipping an assistant surface "
+            "to real users."
+        ),
+        "relevance": {"c26": 2, "c25": 2, "c08": 1},
+    },
 ]
 
 # Hard queries: every strong candidate here sits inside the Python backend
@@ -649,6 +757,102 @@ HARD_QUERIES = [
             "semantics for long running jobs."
         ),
         "relevance": {"c23": 2, "c02": 2, "c03": 1},
+    },
+    # ------------------------------------------------------------------
+    # Dev set expansion (within-role). Same Python backend cluster, ten further
+    # requirements that separate people inside it.
+    # ------------------------------------------------------------------
+    {
+        "id": "h8_flask_internal_tools",
+        "job_description": (
+            "Python Backend Engineer for internal tooling. Small Flask "
+            "applications, reporting screens and automating manual workflows "
+            "for finance and operations teams."
+        ),
+        # The deliberately modest CVs are the RIGHT answer here. A system that
+        # has learned "senior and distributed means better" ranks them last.
+        "relevance": {"c30": 2, "c21": 2, "c32": 1, "c22": 1},
+    },
+    {
+        "id": "h9_orm_migrations",
+        "job_description": (
+            "Python Backend Engineer to own the data access layer: SQLAlchemy "
+            "models, Alembic migrations and evolving schemas without downtime."
+        ),
+        "relevance": {"c22": 2, "c02": 1, "c21": 1, "c23": 1},
+    },
+    {
+        "id": "h10_caching_latency",
+        "job_description": (
+            "Python Backend Engineer to cut response times with caching. You "
+            "will own the Redis layer, cache invalidation and hit-rate "
+            "measurement."
+        ),
+        "relevance": {"c01": 2, "c03": 2, "c25": 2, "c28": 1},
+    },
+    {
+        "id": "h11_grpc_contracts",
+        "job_description": (
+            "Python Backend Engineer for service-to-service APIs: gRPC, "
+            "protobuf contracts and versioning them across several teams."
+        ),
+        "relevance": {"c04": 2, "c01": 1, "c03": 1},
+    },
+    {
+        "id": "h12_instrumentation",
+        "job_description": (
+            "Python Backend Engineer to instrument our services properly: "
+            "structured logging, distributed tracing and OpenTelemetry "
+            "throughout the request path."
+        ),
+        "relevance": {"c28": 2, "c29": 1, "c12": 1, "c01": 1},
+    },
+    {
+        "id": "h13_load_testing",
+        "job_description": (
+            "Python Backend Engineer for performance validation: load testing, "
+            "capacity planning and profiling services ahead of peak traffic."
+        ),
+        "relevance": {"c27": 2, "c11": 1, "c29": 1, "c01": 1},
+    },
+    {
+        "id": "h14_raises_the_bar",
+        "job_description": (
+            "Senior Python Backend Engineer to raise engineering standards on "
+            "the team: code review, architecture review and mentoring the "
+            "junior engineers."
+        ),
+        "relevance": {"c23": 2, "c01": 2, "c29": 1, "c04": 1},
+    },
+    {
+        "id": "h15_mysql_relational",
+        "job_description": (
+            "Python Backend Engineer with deep relational modelling experience "
+            "on MySQL or Oracle: schema design, reporting queries and logic "
+            "held in the database."
+        ),
+        # Pairs against h5, which is the same skill on PostgreSQL under load.
+        "relevance": {"c21": 2, "c02": 1, "c23": 1, "c15": 1},
+    },
+    {
+        "id": "h16_retrieval_evaluation",
+        "job_description": (
+            "Python Backend Engineer to own retrieval quality measurement: "
+            "build the benchmark, compute nDCG and recall, and decide on the "
+            "evidence whether a change ships."
+        ),
+        # c10 has done exactly this work but is an NLP engineer, not a backend
+        # hire, so a 1 rather than a 2.
+        "relevance": {"c25": 2, "c10": 1, "c24": 1, "c26": 1, "c01": 1},
+    },
+    {
+        "id": "h17_small_team_support",
+        "job_description": (
+            "Python Backend Engineer for a four person team. You will ship "
+            "features, run your own deploys and share the production support "
+            "rota. Breadth matters more than depth here."
+        ),
+        "relevance": {"c31": 2, "c29": 2, "c21": 1, "c01": 1},
     },
 ]
 

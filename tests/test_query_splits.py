@@ -53,8 +53,14 @@ class SplitIntegrityTest(unittest.TestCase):
         meaning without anything failing."""
         self.assertIs(QUERIES, DEV_QUERIES)
         self.assertIs(HARD_QUERIES, DEV_HARD_QUERIES)
-        self.assertEqual(len(QUERIES), 8)
-        self.assertEqual(len(HARD_QUERIES), 7)
+        self.assertEqual(
+            [q["id"] for q in QUERIES],
+            [q["id"] for q in select_queries("dev", "cross")],
+        )
+        self.assertEqual(
+            [q["id"] for q in HARD_QUERIES],
+            [q["id"] for q in select_queries("dev", "within")],
+        )
 
     def test_default_split_is_dev(self):
         """A `test` default is how a held-out set gets quietly consumed."""
@@ -113,27 +119,39 @@ class TestSetQualityTest(unittest.TestCase):
                 # a label by corpus_stats and inflate the distractor count.
                 self.assertIn(grade, (1, 2), f"{query['id']}:{cid} grade {grade}")
 
-    def test_every_held_out_query_has_a_strong_answer(self):
+    def test_every_query_has_a_strong_answer(self):
         """A query with only partial matches cannot distinguish a good ranking
         from a mediocre one, because there is no correct top result."""
-        for query in select_queries("test"):
+        for query in select_queries("all"):
             self.assertIn(2, query["relevance"].values(), query["id"])
+
+    def test_dev_set_is_large_enough_to_settle_small_effects(self):
+        """The dev set was expanded specifically because 15 queries could
+        separate a 0.16 nDCG effect but not a 0.05 one, which left chunk size
+        chosen on noise. Shrinking it back would silently restore that."""
+        self.assertGreaterEqual(len(select_queries("dev", "within")), 15)
+        self.assertGreaterEqual(len(select_queries("dev", "cross")), 15)
+        self.assertGreaterEqual(len(select_queries("all")), 50)
 
     def test_held_out_queries_face_a_large_distractor_field(self):
         self.assertGreaterEqual(
             corpus_stats("test")["min_distractors_per_query"], 20
         )
 
-    def test_within_role_test_queries_stay_inside_the_python_cluster(self):
-        """Their discriminating power depends on the strong answers all being
+    def test_within_role_queries_stay_inside_the_python_cluster(self):
+        """Checked on BOTH splits, not just the held-out one.
+
+        Their discriminating power depends on the strong answers all being
         plausible Python backend hires. A within-role query whose best answer
-        is the React developer is really a cross-role query, and would be
-        easy for the wrong reason."""
+        is the React developer is really a cross-role query, and would be easy
+        for the wrong reason -- which would quietly inflate the number this
+        project leans on hardest.
+        """
         cluster = {
             "c01", "c02", "c03", "c04", "c21", "c22", "c23", "c24", "c25",
             "c26", "c27", "c28", "c29", "c30", "c31", "c32",
         }
-        for query in select_queries("test", "within"):
+        for query in select_queries("all", "within"):
             strong = {cid for cid, g in query["relevance"].items() if g == 2}
             self.assertTrue(
                 strong <= cluster,
