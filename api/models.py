@@ -65,3 +65,99 @@ class ScreenResponse(BaseModel):
         ..., description="Matched candidates, best first"
     )
     screened_at: str = Field(..., description="ISO 8601 UTC timestamp of screening")
+
+
+# ---------------------------------------------------------------------------
+# Browsing the candidate pool
+# ---------------------------------------------------------------------------
+
+class CandidateSummary(BaseModel):
+    """One candidate as they appear in a roster listing."""
+
+    candidate_id: str
+    name: str
+    location: str
+    years_of_experience: int
+    cv_path: str = Field(..., description="Server-side path; fetch the file via /cv")
+    chunk_count: int = Field(..., description="Indexed chunks for this candidate")
+
+
+class CandidateList(BaseModel):
+    total: int = Field(..., description="Candidates matching the filters, before paging")
+    limit: int
+    offset: int
+    candidates: List[CandidateSummary]
+
+
+class CandidateDetail(CandidateSummary):
+    indexed_text: str = Field(
+        ..., description="The text actually indexed for this candidate, chunks rejoined"
+    )
+
+
+class PoolStats(BaseModel):
+    candidates: int
+    chunks: int
+    locations: dict
+    experience_years: dict
+
+
+# ---------------------------------------------------------------------------
+# Screening history and recruiter decisions
+# ---------------------------------------------------------------------------
+
+class DecisionRequest(BaseModel):
+    decision: str = Field(
+        ...,
+        description="One of: shortlisted, rejected, maybe, undecided",
+    )
+    note: Optional[str] = Field(
+        default=None, max_length=2000,
+        description="Free-text note, e.g. why this candidate was rejected",
+    )
+
+    @field_validator("decision")
+    @classmethod
+    def known_decision(cls, value: str) -> str:
+        allowed = ("shortlisted", "rejected", "maybe", "undecided")
+        if value not in allowed:
+            raise ValueError(f"decision must be one of {allowed}")
+        return value
+
+
+class DecisionRecord(BaseModel):
+    candidate_id: str
+    decision: str
+    note: Optional[str] = None
+    updated_at: str
+
+
+class ScreeningSummary(BaseModel):
+    job_id: str
+    job_description_preview: str
+    candidate_count: int
+    shortlisted_count: int
+    reranked: bool = Field(..., description="False means the LLM was unavailable")
+    created_at: str
+
+
+class ScreeningHistory(BaseModel):
+    total: int
+    screenings: List[ScreeningSummary]
+
+
+class ScreenedCandidate(CandidateMatch):
+    """A search result, plus whatever the recruiter decided about them."""
+
+    decision: str = Field(default="undecided")
+    note: Optional[str] = None
+
+
+class ScreeningDetail(BaseModel):
+    job_id: str
+    job_description: str
+    filters: Optional[dict] = None
+    candidates: List[ScreenedCandidate]
+    timings: dict = Field(default_factory=dict)
+    reranked: bool
+    created_at: str

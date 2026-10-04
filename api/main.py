@@ -10,15 +10,29 @@ from dotenv import load_dotenv
 # QDRANT_HOST / QDRANT_COLLECTION / RETRIEVAL_TOP_N at module import time.
 load_dotenv()
 
-from fastapi import FastAPI, Depends, HTTPException, Security, status
+from fastapi import FastAPI, Depends, HTTPException, Query, Security, status
+from fastapi.responses import FileResponse, StreamingResponse
 from fastapi.security.api_key import APIKeyHeader
 
 # Import our custom modules
 from indexer.utils import get_logger
 from indexer.embedder import CVEmbedder
-from api.models import ScreenRequest, ScreenResponse, CandidateMatch
+from api.catalogue import CandidateCatalogue
+from api.models import (
+    CandidateDetail,
+    CandidateList,
+    CandidateMatch,
+    DecisionRecord,
+    DecisionRequest,
+    PoolStats,
+    ScreenRequest,
+    ScreenResponse,
+    ScreeningDetail,
+    ScreeningHistory,
+)
 from api.retriever import CVRetriever
 from api.reranker import CVReranker
+from api.store import ScreeningStore
 
 logger = get_logger("api.main")
 
@@ -58,11 +72,13 @@ def stage_timer(sink: dict, key: str):
 embedder = None
 retriever = None
 reranker = None
+store = None
+catalogue = None
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     """Lifespan event handler to pre-load heavy embedding models and database clients."""
-    global embedder, retriever, reranker
+    global embedder, retriever, reranker, store, catalogue
     logger.info("Initializing Shortlist microservice...")
     try:
         # Pre-load embedding model on CPU
@@ -71,6 +87,10 @@ async def lifespan(app: FastAPI):
         retriever = CVRetriever()
         # Initialize reranking clients
         reranker = CVReranker()
+        # Screening history and recruiter decisions
+        store = ScreeningStore()
+        # Read-only views over the indexed pool, sharing the retriever's client
+        catalogue = CandidateCatalogue(retriever.client, retriever.collection_name)
         logger.info("All services initialized successfully.")
     except Exception as e:
         logger.critical(f"Failed to initialize core services on startup: {e}")
@@ -196,6 +216,26 @@ async def screen_resumes(request: ScreenRequest):
     ]
 
     timings["total_ms"] = round(sum(timings.values()), 1)
+
+    # Persist the run so the shortlist can be reopened or shared without
+    # re-running the search, which would cost another LLM call and could return
+    # a different order.
+    reranked = any(
+        "not scored by reranker" not in c["match_reasoning"] for c in reranked_candidates
+    )
+    try:
+        store.save_screening(
+            job_id=str(job_id),
+            job_description=request.job_description,
+            filters=request.filters.model_dump(exclude_none=True) if request.filters else None,
+            candidates=[c.model_dump() for c in candidate_matches],
+            timings=timings,
+            reranked=reranked,
+        )
+    except Exception as e:
+        # A failed write must not lose the results the caller is waiting for.
+        logger.error(f"Could not persist screening {job_id}: {e}")
+
     logger.info(
         f"Screening complete (Job ID: {job_id}). "
         f"retrieved={len(retrieved_candidates)} returned={len(candidate_matches)} timings={timings}"
@@ -249,3 +289,235 @@ async def health_check():
         )
         
     return details
+
+
+# ---------------------------------------------------------------------------
+# Browsing the candidate pool
+#
+# A recruiter's first question is "who is in here?", which is not a similarity
+# search. These read Qdrant's stored payloads directly.
+# ---------------------------------------------------------------------------
+
+def _require_ready():
+    if not catalogue or not store:
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail="Services are still initializing or failed to load.",
+        )
+
+
+@app.get(
+    "/api/v1/candidates",
+    response_model=CandidateList,
+    dependencies=[Depends(verify_api_key)],
+    tags=["Candidates"],
+    summary="Browse the indexed candidate pool",
+)
+async def list_candidates(
+    limit: int = Query(50, ge=1, le=200),
+    offset: int = Query(0, ge=0),
+    location: str = Query(None, description="Exact city match, alias-normalised"),
+    min_experience: int = Query(None, ge=0, le=60),
+    name_contains: str = Query(None, max_length=100),
+):
+    _require_ready()
+    from indexer.parser import normalize_location
+
+    try:
+        return catalogue.list_candidates(
+            limit=limit,
+            offset=offset,
+            location=normalize_location(location) if location else None,
+            min_experience=min_experience,
+            name_contains=name_contains,
+        )
+    except Exception as e:
+        logger.error(f"Could not list candidates: {e}")
+        raise HTTPException(status_code=500, detail="Error reading the candidate pool.")
+
+
+@app.get(
+    "/api/v1/candidates/stats",
+    response_model=PoolStats,
+    dependencies=[Depends(verify_api_key)],
+    tags=["Candidates"],
+    summary="Summary of what is indexed",
+)
+async def pool_stats():
+    _require_ready()
+    try:
+        return catalogue.stats()
+    except Exception as e:
+        logger.error(f"Could not compute pool stats: {e}")
+        raise HTTPException(status_code=500, detail="Error reading the candidate pool.")
+
+
+@app.get(
+    "/api/v1/candidates/{candidate_id}",
+    response_model=CandidateDetail,
+    dependencies=[Depends(verify_api_key)],
+    tags=["Candidates"],
+    summary="One candidate, including the text that was indexed",
+)
+async def get_candidate(candidate_id: str):
+    _require_ready()
+    record = catalogue.get_candidate(candidate_id)
+    if not record:
+        raise HTTPException(status_code=404, detail="Candidate not found.")
+    return record
+
+
+@app.get(
+    "/api/v1/candidates/{candidate_id}/cv",
+    dependencies=[Depends(verify_api_key)],
+    tags=["Candidates"],
+    summary="Download the candidate's original CV file",
+)
+async def get_candidate_cv(candidate_id: str):
+    """Serve the original PDF/DOCX.
+
+    The screening response carries a server-side `cv_path`, which a client
+    cannot open. This is how a recruiter actually reads the resume.
+    """
+    _require_ready()
+    if not catalogue.get_candidate(candidate_id):
+        raise HTTPException(status_code=404, detail="Candidate not found.")
+
+    path = catalogue.resolve_cv_file(candidate_id)
+    if not path:
+        # Indexed, but the file is gone or sits outside CV_FOLDER_PATH.
+        # Distinguished from 404 so the caller knows the candidate exists.
+        raise HTTPException(
+            status_code=410,
+            detail="The CV file is no longer available on this server.",
+        )
+    return FileResponse(path=str(path), filename=path.name)
+
+
+# ---------------------------------------------------------------------------
+# Screening history and recruiter decisions
+# ---------------------------------------------------------------------------
+
+@app.get(
+    "/api/v1/screenings",
+    response_model=ScreeningHistory,
+    dependencies=[Depends(verify_api_key)],
+    tags=["Screenings"],
+    summary="Previous screening runs, newest first",
+)
+async def list_screenings(
+    limit: int = Query(20, ge=1, le=100), offset: int = Query(0, ge=0)
+):
+    _require_ready()
+    return {
+        "total": store.count_screenings(),
+        "screenings": store.list_screenings(limit=limit, offset=offset),
+    }
+
+
+@app.get(
+    "/api/v1/screenings/{job_id}",
+    response_model=ScreeningDetail,
+    dependencies=[Depends(verify_api_key)],
+    tags=["Screenings"],
+    summary="Reopen a screening run with its decisions",
+)
+async def get_screening(job_id: str):
+    """Returns the stored results, not a fresh search.
+
+    Re-running would cost another LLM call and could return a different order,
+    so a reopened shortlist shows exactly what the recruiter saw.
+    """
+    _require_ready()
+    run = store.get_screening(job_id)
+    if not run:
+        raise HTTPException(status_code=404, detail="Screening not found.")
+
+    decisions = store.get_decisions(job_id)
+    for candidate in run["candidates"]:
+        record = decisions.get(candidate["candidate_id"])
+        candidate["decision"] = record["decision"] if record else "undecided"
+        candidate["note"] = record["note"] if record else None
+    return run
+
+
+@app.put(
+    "/api/v1/screenings/{job_id}/candidates/{candidate_id}/decision",
+    response_model=DecisionRecord,
+    dependencies=[Depends(verify_api_key)],
+    tags=["Screenings"],
+    summary="Shortlist, reject or flag a candidate",
+)
+async def set_decision(job_id: str, candidate_id: str, request: DecisionRequest):
+    _require_ready()
+    run = store.get_screening(job_id)
+    if not run:
+        raise HTTPException(status_code=404, detail="Screening not found.")
+    if not any(c["candidate_id"] == candidate_id for c in run["candidates"]):
+        # Decisions belong to a run, so a candidate outside it is a client error
+        # rather than a missing record.
+        raise HTTPException(
+            status_code=400,
+            detail="That candidate is not part of this screening.",
+        )
+
+    store.set_decision(job_id, candidate_id, request.decision, request.note)
+    saved = store.get_decisions(job_id)[candidate_id]
+    logger.info(f"Decision on {candidate_id} in {job_id}: {request.decision}")
+    return {"candidate_id": candidate_id, **saved}
+
+
+@app.get(
+    "/api/v1/screenings/{job_id}/shortlist.csv",
+    dependencies=[Depends(verify_api_key)],
+    tags=["Screenings"],
+    summary="Export the shortlist as CSV",
+)
+async def export_shortlist(
+    job_id: str,
+    decision: str = Query("shortlisted", description="Which decision to export, or 'all'"),
+):
+    """CSV because recruiters work in spreadsheets, and a shortlist has to leave
+    the tool to be useful to anyone else."""
+    _require_ready()
+    run = store.get_screening(job_id)
+    if not run:
+        raise HTTPException(status_code=404, detail="Screening not found.")
+
+    decisions = store.get_decisions(job_id)
+    rows = [
+        (c, decisions.get(c["candidate_id"], {}))
+        for c in run["candidates"]
+        if decision == "all"
+        or decisions.get(c["candidate_id"], {}).get("decision") == decision
+    ]
+
+    def generate():
+        import csv
+        import io
+
+        buffer = io.StringIO()
+        writer = csv.writer(buffer)
+        writer.writerow(
+            ["name", "candidate_id", "score", "decision", "note", "match_reasoning"]
+        )
+        yield buffer.getvalue()
+        for candidate, record in rows:
+            buffer.seek(0)
+            buffer.truncate(0)
+            writer.writerow([
+                candidate["name"],
+                candidate["candidate_id"],
+                f"{candidate['score']:.3f}",
+                record.get("decision", "undecided"),
+                record.get("note") or "",
+                candidate["match_reasoning"],
+            ])
+            yield buffer.getvalue()
+
+    filename = "shortlist-" + str(job_id)[:8] + ".csv"
+    return StreamingResponse(
+        generate(),
+        media_type="text/csv",
+        headers={"Content-Disposition": "attachment; filename=" + filename},
+    )

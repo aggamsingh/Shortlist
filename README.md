@@ -156,7 +156,37 @@ Two things this surfaced that local runs never could:
 
 ### Serving (`api/`)
 
-`POST /api/v1/screen` embeds the JD, applies hard filters in Qdrant, retrieves a shortlist, reranks, and returns the top `k`. `GET /health` reports Qdrant connectivity, model load, and whether an LLM is actually configured.
+| | |
+|---|---|
+| `POST /api/v1/screen` | Rank candidates against a job description |
+| `GET /api/v1/candidates` | Browse the pool, paginated and filterable |
+| `GET /api/v1/candidates/stats` | What is indexed: counts, locations, experience spread |
+| `GET /api/v1/candidates/{id}` | One candidate, including the text actually indexed |
+| `GET /api/v1/candidates/{id}/cv` | **Download the original PDF/DOCX** |
+| `GET /api/v1/screenings` | Previous runs, newest first |
+| `GET /api/v1/screenings/{job_id}` | Reopen a run with its decisions |
+| `PUT /api/v1/screenings/{job_id}/candidates/{id}/decision` | Shortlist / reject / maybe, with a note |
+| `GET /api/v1/screenings/{job_id}/shortlist.csv` | Export as CSV |
+| `GET /health` | Qdrant connectivity, model load, whether an LLM is configured |
+
+Ranking alone is not a usable tool. A recruiter needs to see who is in the pool,
+read the actual resume, record a decision, and come back to it tomorrow — so:
+
+- **`cv_path` became openable.** The screening response carries a server-side
+  path a client cannot use; `/cv` serves the file. The stored path is validated
+  against `CV_FOLDER_PATH` first, because serving a payload-supplied path
+  unchecked is a directory traversal hole, and an index built in Docker
+  (`/app/cvs/...`) then served from the host falls back to matching by filename.
+- **Runs are persisted.** `job_id` used to be generated, logged, and discarded.
+  Reopening returns the *stored* results rather than re-running: a second search
+  costs another LLM call and can return a different order, so a shortlist would
+  not be the thing the recruiter saw.
+- **Decisions live separately from results.** A shortlist gets revised
+  repeatedly, while the search output is immutable evidence of what the system
+  returned at the time.
+- **SQLite, via stdlib `sqlite3`.** A run is a handful of small rows; Qdrant is a
+  vector index rather than a record store, and adding Postgres would mean
+  another service to deploy for no benefit.
 
 ---
 
