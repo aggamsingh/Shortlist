@@ -66,7 +66,10 @@ def main() -> None:
         for q in ALL_QUERIES:
             strong = [k for k, v in q["relevance"].items() if v == 2]
             partial = [k for k, v in q["relevance"].items() if v == 1]
-            print(f"  {q['id']:24} strong={','.join(strong) or '-':22} "
+            # The split is shown because it changes how a number may be used:
+            # dev queries chose the configuration, test queries only check it.
+            print(f"  [{q['split']:4}] {q['id']:24} "
+                  f"strong={','.join(strong) or '-':22} "
                   f"partial={','.join(partial) or '-'}")
         return
 

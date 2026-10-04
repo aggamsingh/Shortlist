@@ -652,7 +652,268 @@ HARD_QUERIES = [
     },
 ]
 
-ALL_QUERIES = QUERIES + HARD_QUERIES
+# ---------------------------------------------------------------------------
+# HELD-OUT TEST QUERIES
+#
+# Everything above is the DEV set. Every design decision in this project --
+# chunking strategy, window size, hybrid vs dense, retrieval budget -- was made
+# by looking at those 15 queries, and then the same 15 were used to report the
+# headline numbers. That is tuning on the test set, and it makes those numbers
+# optimistic by an unknown margin.
+#
+# Partitioning the dev set would not fix it: all 15 have already influenced the
+# configuration, so neither half is clean. A real held-out set has to consist of
+# queries that have never been looked at while choosing anything. These are
+# those queries, written against the existing candidates without consulting any
+# retrieval output.
+#
+# They also deliberately probe axes the dev set never touches -- seniority,
+# domain, legacy migration, accessibility, testing discipline, the conjunction
+# of lexical AND vector search -- so they measure generalisation to new kinds of
+# job description, not just new wordings of the old ones.
+#
+# The discipline this only works under: do not tune against these. If a
+# measurement on the test set motivates a change, the change is chosen on dev,
+# and the test set is re-measured once afterwards.
+# ---------------------------------------------------------------------------
+
+TEST_QUERIES = [
+    {
+        "id": "t1_full_stack",
+        "job_description": (
+            "Full Stack Engineer to own features end to end: a React and "
+            "TypeScript frontend talking to Node.js and Express services backed "
+            "by MongoDB. You will write both halves and the tests between them."
+        ),
+        # Only c07 has both halves. The React-only engineers are plausible but
+        # unproven on the backend, which is what the grade split records.
+        "relevance": {"c07": 2, "c05": 1, "c06": 1},
+    },
+    {
+        "id": "t2_cloud_architecture",
+        "job_description": (
+            "Cloud Architect to design our AWS account structure, landing zones "
+            "and governance model for a regulated financial institution. You will "
+            "own networking, security boundaries and cloud cost management."
+        ),
+        "relevance": {"c13": 2, "c11": 1, "c12": 1},
+    },
+    {
+        "id": "t3_observability_oncall",
+        "job_description": (
+            "Site Reliability Engineer focused on observability and incident "
+            "response. You will define SLOs and error budgets, build dashboards "
+            "and tracing, run on-call and write postmortems."
+        ),
+        # Narrower than the dev DevOps query: this turns on SLOs, tracing and
+        # on-call rather than on Kubernetes and Terraform.
+        "relevance": {"c12": 2, "c11": 1, "c29": 1, "c28": 1},
+    },
+    {
+        "id": "t4_data_warehouse_sql",
+        "job_description": (
+            "Data Warehouse Developer for an enterprise reporting platform. The "
+            "work is heavy SQL: dimensional modelling, stored procedures, nightly "
+            "batch loads and reconciliation against source systems."
+        ),
+        # Deliberately inverts the dev data-engineering query, where c14 was the
+        # strong hire and c15 the partial. A system that has learned
+        # "data -> Spark and Kafka" gets this one backwards.
+        "relevance": {"c15": 2, "c14": 1, "c32": 1},
+    },
+    {
+        "id": "t5_mlops",
+        "job_description": (
+            "Machine Learning Engineer to own models in production: training "
+            "pipelines, experiment tracking, deployment of inference services and "
+            "monitoring for model drift after release."
+        ),
+        "relevance": {"c08": 2, "c19": 1, "c10": 1},
+    },
+    {
+        "id": "t6_experimentation",
+        "job_description": (
+            "Data Scientist for our experimentation and forecasting work. You "
+            "will design and read A/B tests, estimate causal impact for product "
+            "teams, and build demand forecasts with gradient boosted models."
+        ),
+        "relevance": {"c09": 2, "c19": 1, "c08": 1},
+    },
+    {
+        "id": "t7_accessible_frontend",
+        "job_description": (
+            "Frontend Developer with a focus on accessibility. You will take our "
+            "React product to WCAG AA, own responsive layouts across devices and "
+            "write component level tests."
+        ),
+        # c06 is the only CV with accessibility evidence; the stronger generalist
+        # React engineers are partials. Tests whether retrieval can find one
+        # specific requirement inside a role it already separates easily.
+        "relevance": {"c06": 2, "c05": 1, "c20": 1},
+    },
+    {
+        "id": "t8_platform_engineering",
+        "job_description": (
+            "Platform Engineer to build the internal developer platform other "
+            "teams ship on. Expect Go and gRPC service scaffolding, a service "
+            "mesh, and tooling that 40 or more engineers depend on daily."
+        ),
+        "relevance": {"c04": 2, "c29": 1, "c11": 1, "c12": 1},
+    },
+    {
+        "id": "t9_engineering_leadership",
+        "job_description": (
+            "Principal Engineer to set technical direction across several teams. "
+            "You will mentor engineers, run architecture review, and be "
+            "accountable for the long term health of a large codebase."
+        ),
+        # A seniority and scope axis rather than a technology axis. Nothing in the
+        # dev set probes this, and the keywords barely appear in the corpus.
+        "relevance": {"c23": 2, "c13": 2, "c01": 1, "c04": 1},
+    },
+]
+
+# Held-out WITHIN-ROLE queries: the same Python backend cluster as HARD_QUERIES,
+# so the generic keywords carry no signal, but probing requirements the dev hard
+# queries never mention.
+TEST_HARD_QUERIES = [
+    {
+        "id": "ht1_testing_discipline",
+        "job_description": (
+            "Python Backend Engineer who takes testing seriously. You will own "
+            "unit and integration test coverage for our services, keep the suite "
+            "fast and meaningful, and gate every merge on it in CI."
+        ),
+        # c16 is the trap and is graded 1, not 0: a QA automation engineer with
+        # deep pytest experience is genuinely adjacent, just not a backend hire.
+        # Suppressing them entirely would be as wrong as ranking them first.
+        "relevance": {"c01": 2, "c22": 2, "c31": 1, "c02": 1, "c16": 1},
+    },
+    {
+        "id": "ht2_fintech_domain",
+        "job_description": (
+            "Python Backend Engineer for a payments platform. You will work on "
+            "money movement in a regulated environment, where correctness, "
+            "auditability and idempotent retries matter more than throughput."
+        ),
+        # Domain rather than stack. c18 is the trap: insurance, regulated,
+        # microservices, Kafka -- but Java, where the role demands Python.
+        "relevance": {"c03": 2, "c04": 2, "c21": 1, "c18": 1},
+    },
+    {
+        "id": "ht3_realtime_websockets",
+        "job_description": (
+            "Python Backend Engineer for live, always-connected features. The "
+            "role centres on WebSocket connections pushing real time updates to "
+            "dashboards, and keeping thousands of them open per instance."
+        ),
+        "relevance": {"c28": 2, "c27": 1, "c03": 1},
+    },
+    {
+        "id": "ht4_consumer_scale",
+        "job_description": (
+            "Senior Python Backend Engineer for a consumer product serving "
+            "millions of users. We want someone who has carried a system at that "
+            "scale, not just built one, including capacity planning for peaks."
+        ),
+        "relevance": {"c23": 2, "c01": 2, "c27": 2, "c29": 1},
+    },
+    {
+        "id": "ht5_legacy_modernisation",
+        "job_description": (
+            "Python Backend Engineer to modernise a legacy system. You will break "
+            "a monolith into deployable services incrementally, without a rewrite "
+            "and without downtime for existing users."
+        ),
+        "relevance": {"c01": 2, "c23": 1, "c04": 1, "c13": 1},
+    },
+    {
+        "id": "ht6_hybrid_search",
+        "job_description": (
+            "Backend Engineer for relevance. You will run both keyword and "
+            "embedding based retrieval over the same catalogue and combine them "
+            "into one ranking, then prove the combination beats either alone."
+        ),
+        # The conjunction of dev h1 (vector) and dev h6 (lexical), and so a real
+        # generalisation test: the right answers are the two people who have done
+        # both, ranked above the specialists who have only done one.
+        "relevance": {"c26": 2, "c24": 2, "c25": 1, "c23": 1, "c01": 1},
+    },
+    {
+        "id": "ht7_batch_and_light_api",
+        "job_description": (
+            "Python Engineer sitting between data and backend: scheduled batch "
+            "jobs over large files with pandas, plus a handful of internal "
+            "endpoints so other teams can pull the results."
+        ),
+        # Targets the weak end of the Python cluster, who are never the right
+        # answer anywhere else. Without a query like this the corpus never tests
+        # whether retrieval can rank them ABOVE the strong engineers when the job
+        # is genuinely smaller.
+        "relevance": {"c32": 2, "c30": 1, "c14": 1},
+    },
+    {
+        "id": "ht8_early_career",
+        "job_description": (
+            "Python Backend Developer, early career, two to four years of "
+            "experience. You will be mentored by senior engineers while building "
+            "internal API endpoints and learning our stack."
+        ),
+        # A seniority axis. Honest caveat: years_of_experience is also a metadata
+        # filter, so this query exercises the text path only, where the signal is
+        # the phrasing of the summary line rather than a number.
+        "relevance": {"c22": 2, "c30": 1, "c26": 1},
+    },
+]
+
+
+# ---------------------------------------------------------------------------
+# Splits
+#
+# The split is stamped onto the query itself, so a query cannot be silently
+# moved between sets by a change to list membership somewhere else.
+# ---------------------------------------------------------------------------
+
+DEV_QUERIES = QUERIES
+DEV_HARD_QUERIES = HARD_QUERIES
+
+for _q in DEV_QUERIES + DEV_HARD_QUERIES:
+    _q["split"] = "dev"
+for _q in TEST_QUERIES + TEST_HARD_QUERIES:
+    _q["split"] = "test"
+del _q
+
+SPLITS = ("dev", "test", "all")
+
+ALL_QUERIES = DEV_QUERIES + DEV_HARD_QUERIES + TEST_QUERIES + TEST_HARD_QUERIES
+
+
+def select_queries(split: str = "dev", kind: str = "all") -> list:
+    """Queries for one split.
+
+    `kind` is "cross" (different roles, separable by topic), "within" (all
+    Python backend, separable only by one requirement) or "all".
+
+    Defaults to dev, because the default has to be the safe one: a harness that
+    reported test numbers unless told otherwise would be tuned against within a
+    week, which is how the leakage happened the first time.
+    """
+    if split not in SPLITS:
+        raise ValueError(f"split must be one of {SPLITS}, got {split!r}")
+    if kind not in ("cross", "within", "all"):
+        raise ValueError(f"kind must be cross, within or all, got {kind!r}")
+
+    cross = (DEV_QUERIES if split in ("dev", "all") else []) + (
+        TEST_QUERIES if split in ("test", "all") else []
+    )
+    within = (DEV_HARD_QUERIES if split in ("dev", "all") else []) + (
+        TEST_HARD_QUERIES if split in ("test", "all") else []
+    )
+    if kind == "cross":
+        return cross
+    if kind == "within":
+        return within
+    return cross + within
 
 
 def render_cv(candidate: dict) -> str:
@@ -722,26 +983,28 @@ def render_cv(candidate: dict) -> str:
     return header + "\n" + body
 
 
-def corpus_stats() -> dict:
+def corpus_stats(split: str = "all") -> dict:
     """Summary used by the eval report header.
 
     Distraction is measured PER QUERY, not globally. Counting candidates that
     are never relevant to anything understates it badly once most candidates are
-    the target of some query: what matters is that each individual query has a
-    large field of non-relevant candidates to be confused by, many of them
-    sharing its keywords.
+    the target of some query -- which is now every one of them. What matters is
+    that each individual query has a large field of non-relevant candidates to
+    be confused by, many of them sharing its keywords.
     """
-    per_query_distractors = [
-        len(CANDIDATES) - len(q["relevance"]) for q in ALL_QUERIES
-    ]
+    queries = select_queries(split, "all")
+    per_query_distractors = [len(CANDIDATES) - len(q["relevance"]) for q in queries]
     never_relevant = len(CANDIDATES) - len(
-        {cid for q in ALL_QUERIES for cid in q["relevance"]}
+        {cid for q in queries for cid in q["relevance"]}
     )
     return {
         "candidates": len(CANDIDATES),
-        "queries": len(ALL_QUERIES),
-        "cross_role_queries": len(QUERIES),
-        "within_role_queries": len(HARD_QUERIES),
+        "split": split,
+        "queries": len(queries),
+        "cross_role_queries": len(select_queries(split, "cross")),
+        "within_role_queries": len(select_queries(split, "within")),
+        "dev_queries": len(select_queries("dev", "all")),
+        "test_queries": len(select_queries("test", "all")),
         "min_distractors_per_query": min(per_query_distractors),
         "mean_distractors_per_query": round(
             sum(per_query_distractors) / len(per_query_distractors), 1

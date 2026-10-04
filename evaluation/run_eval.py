@@ -3,9 +3,16 @@
 Builds a throwaway Qdrant index from the synthetic corpus, runs every labelled
 job description through the pipeline and reports ranking quality.
 
-    python -m evaluation.run_eval               # headline numbers
-    python -m evaluation.run_eval --ablations   # compare design choices
+    python -m evaluation.run_eval               # dev set, headline numbers
+    python -m evaluation.run_eval --ablations   # dev set, compare design choices
     python -m evaluation.run_eval --rerank      # include the LLM reranker
+    python -m evaluation.run_eval --split test  # the held-out set (read once)
+
+Queries are split into dev and test (see evaluation/corpus.py). Everything
+defaults to DEV, because every design decision in this project was made against
+the dev queries and a harness that reported held-out numbers by default would
+end up tuned against them. `--split test` is for confirming a configuration
+already chosen on dev, not for choosing one.
 
 Runs against an embedded Qdrant (no server needed), so it is reproducible on a
 laptop and in CI. Note that embedded Qdrant ignores payload indexes; those matter
@@ -21,7 +28,7 @@ from pathlib import Path
 from qdrant_client import QdrantClient
 from qdrant_client.http import models
 
-from evaluation.corpus import CANDIDATES, HARD_QUERIES, QUERIES, corpus_stats, render_cv
+from evaluation.corpus import CANDIDATES, corpus_stats, render_cv, select_queries
 from evaluation.metrics import aggregate, evaluate_query, recall_at_k
 from indexer.embedder import CVEmbedder
 from indexer.parser import chunk_by_words, chunk_cv, clean_text
@@ -214,7 +221,8 @@ def evaluate_config(client, embedder, retriever_name: str, budget: int, k: int,
                     reranker=None, queries=None) -> dict:
     """Run every query under one configuration and average the metrics."""
     retrieve = RETRIEVERS[retriever_name]
-    queries = QUERIES if queries is None else queries
+    if queries is None:
+        queries = select_queries("dev", "cross")
     per_query, distinct_counts = [], []
     degraded = 0
 
@@ -301,15 +309,32 @@ def main() -> None:
     parser.add_argument("--rerank", action="store_true", help="include the LLM reranker")
     parser.add_argument("--k", type=int, default=5, help="cutoff for @k metrics")
     parser.add_argument("--budget", type=int, default=10, help="retrieval budget")
+    parser.add_argument(
+        "--split",
+        choices=("dev", "test", "all"),
+        default="dev",
+        help="query split to evaluate (default: dev; test is held out)",
+    )
     args = parser.parse_args()
 
-    stats = corpus_stats()
+    stats = corpus_stats(args.split)
     print("Shortlist - retrieval evaluation")
     print(
         f"corpus: {stats['candidates']} CVs, {stats['queries']} job descriptions, "
         f"{stats['min_distractors_per_query']}+ non-relevant candidates per query"
     )
-    print(f"retrieval budget: {args.budget}   metrics cutoff: k={args.k}\n")
+    print(f"retrieval budget: {args.budget}   metrics cutoff: k={args.k}")
+    print(f"split: {args.split.upper()}  ({stats['dev_queries']} dev / "
+          f"{stats['test_queries']} held-out test)")
+    if args.split == "dev":
+        print("note: the shipped configuration was CHOSEN on these queries, so "
+              "these numbers are optimistic.")
+    else:
+        # Said out loud every time, because the whole value of a held-out set is
+        # destroyed quietly rather than loudly.
+        print("note: HELD-OUT queries. Report, do not tune. If a number here "
+              "prompts a change, choose the change on dev and re-measure once.")
+    print()
 
     workdir = Path(tempfile.mkdtemp(prefix="resume_eval_"))
     try:
@@ -331,8 +356,14 @@ def main() -> None:
                 reranker = None
 
         suites = [
-            ("CROSS-ROLE queries (different jobs; separable by topic alone)", QUERIES),
-            ("WITHIN-ROLE queries (all Python backend; the discriminating set)", HARD_QUERIES),
+            (
+                "CROSS-ROLE queries (different jobs; separable by topic alone)",
+                select_queries(args.split, "cross"),
+            ),
+            (
+                "WITHIN-ROLE queries (all Python backend; the discriminating set)",
+                select_queries(args.split, "within"),
+            ),
         ]
 
         if not args.ablations:
