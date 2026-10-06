@@ -221,8 +221,13 @@ RETRIEVERS = {
 # ---------------------------------------------------------------- evaluation
 
 def evaluate_config(client, embedder, retriever_name: str, budget: int, k: int,
-                    reranker=None, queries=None) -> dict:
-    """Run every query under one configuration and average the metrics."""
+                    reranker=None, queries=None, jd_filter=None) -> dict:
+    """Run every query under one configuration and average the metrics.
+
+    `jd_filter`, if given, strips boilerplate from the job description before
+    retrieval, exactly as the service does. The reranker still receives the
+    original text, as it does in the service.
+    """
     retrieve = RETRIEVERS[retriever_name]
     if queries is None:
         queries = select_queries("dev", "cross")
@@ -231,9 +236,14 @@ def evaluate_config(client, embedder, retriever_name: str, budget: int, k: int,
 
     rerank_times = []
     for query in queries:
-        vector = embedder.embed_text(query["job_description"])
+        search_text = (
+            jd_filter.apply(query["job_description"])
+            if jd_filter is not None
+            else query["job_description"]
+        )
+        vector = embedder.embed_text(search_text)
         if retriever_name == "hybrid":
-            ranked = retrieve(client, vector, budget, query["job_description"])
+            ranked = retrieve(client, vector, budget, search_text)
         else:
             ranked = retrieve(client, vector, budget)
         distinct_counts.append(len(ranked))
@@ -339,7 +349,27 @@ def main() -> None:
         default="dev",
         help="query split to evaluate (default: dev; test is held out)",
     )
+    parser.add_argument(
+        "--jd-style",
+        choices=("plain", "A", "B", "C"),
+        default="plain",
+        help="wrap each job description in company boilerplate (C is held out: "
+             "--split test only)",
+    )
+    parser.add_argument(
+        "--jd-filter",
+        action="store_true",
+        help="strip boilerplate from the job description before retrieval, as the "
+             "service does",
+    )
     args = parser.parse_args()
+
+    from evaluation.jd_styles import check_allowed, wrap
+
+    try:
+        check_allowed(args.jd_style, args.split)
+    except ValueError as error:
+        parser.error(str(error))
 
     stats = corpus_stats(args.split)
     print("Shortlist - retrieval evaluation")
@@ -403,6 +433,26 @@ def main() -> None:
                 select_queries(args.split, "within"),
             ),
         ]
+        # Copies, so the labelled corpus is never mutated.
+        suites = [
+            (
+                title,
+                [dict(q, job_description=wrap(q["job_description"], args.jd_style))
+                 for q in qs],
+            )
+            for title, qs in suites
+        ]
+
+        jd_filter = None
+        if args.jd_filter:
+            from api.jd_filter import JDFilter
+
+            jd_filter = JDFilter(embedder)
+        print(
+            f"job descriptions: style {args.jd_style}"
+            + ("  +  boilerplate filter" if jd_filter else "")
+            + "\n"
+        )
 
         if not args.ablations:
             # Must mirror the shipped default (indexer.parser.chunk_resume), or
@@ -415,7 +465,7 @@ def main() -> None:
                 for stage_label, stage in stages:
                     metrics = evaluate_config(
                         client, embedder, "hybrid", args.budget, args.k, stage,
-                        queries=queries,
+                        queries=queries, jd_filter=jd_filter,
                     )
                     label = (
                         "window + hybrid"
@@ -433,7 +483,7 @@ def main() -> None:
                     for retriever_name in ("flat", "grouped", "hybrid"):
                         metrics = evaluate_config(
                             client, embedder, retriever_name, args.budget, args.k,
-                            queries=queries,
+                            queries=queries, jd_filter=jd_filter,
                         )
                         print(
                             format_row(
@@ -447,7 +497,7 @@ def main() -> None:
                     for stage_label, stage in stages[1:]:
                         metrics = evaluate_config(
                             client, embedder, "hybrid", args.budget, args.k, stage,
-                            queries=queries,
+                            queries=queries, jd_filter=jd_filter,
                         )
                         print(
                             format_row(

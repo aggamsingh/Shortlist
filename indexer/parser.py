@@ -110,6 +110,40 @@ def extract_years_of_experience(text: str) -> int:
                 continue
     return 0
 
+def truncate_words(text: str, max_words: int) -> tuple:
+    """Cut text after its Nth word, keeping the original spacing and line breaks.
+
+    Returns (text, truncated). A limit of zero or less disables the cap. Real CVs
+    are a few hundred to a few thousand words; one 120,000-word document produced
+    700 chunks and one 600,000-word document stalled an indexing run for four
+    minutes, so an unbounded file is a way for one upload to starve the rest.
+    """
+    if max_words <= 0:
+        return text, False
+    count = 0
+    for match in re.finditer(r"\S+", text):
+        count += 1
+        if count == max_words:
+            end = match.end()
+            if re.search(r"\S", text[end:]):
+                return text[:end], True
+            return text, False
+    return text, False
+
+
+def content_fingerprint(text: str) -> str:
+    """Hash of a CV's text with case and whitespace normalised away.
+
+    Two files with the same words are the same CV, whatever they are called and
+    whatever metadata their containers carry. The file-bytes hash cannot see that:
+    re-saving a .docx changes its bytes without changing a word of it.
+    """
+    import hashlib
+
+    normalised = " ".join(text.lower().split())
+    return hashlib.sha256(normalised.encode("utf-8")).hexdigest()
+
+
 def clean_text(text: str) -> str:
     """Clean redundant spaces and newlines."""
     text = re.sub(r'\s+', ' ', text)

@@ -1,3 +1,4 @@
+import hmac
 import os
 import time
 import uuid
@@ -32,6 +33,7 @@ from api.models import (
 )
 from api.retriever import CVRetriever
 from api.cross_encoder import CrossEncoderReranker
+from api.jd_filter import build_jd_filter
 from api.reranker import CVReranker
 from api.store import ScreeningStore
 
@@ -55,6 +57,23 @@ def get_default_top_k() -> int:
         return 10
 
 
+_FORMULA_PREFIXES = ("=", "+", "-", "@", "\t", "\r")
+
+
+def csv_safe(value) -> str:
+    """Neutralise spreadsheet formula injection in an exported cell.
+
+    Excel and Sheets execute a cell that starts with = + - or @. Two of the
+    columns are attacker-controlled: a candidate's name is derived from their
+    file name or their CV text, so an applicant can choose it, and a recruiter's
+    note is free text. A cell like =HYPERLINK(...) or =cmd|... would run when the
+    recruiter opens the export. Prefixing an apostrophe makes the spreadsheet
+    treat the cell as plain text, and costs nothing for legitimate values.
+    """
+    text = "" if value is None else str(value)
+    return "'" + text if text.startswith(_FORMULA_PREFIXES) else text
+
+
 def utc_now_iso() -> str:
     """Timezone-aware UTC timestamp in ISO 8601 with a trailing Z."""
     return datetime.now(timezone.utc).isoformat(timespec="seconds").replace("+00:00", "Z")
@@ -75,6 +94,7 @@ retriever = None
 reranker = None
 store = None
 catalogue = None
+jd_filter = None
 
 def build_reranker():
     """Pick the reranking backend from RERANKER_BACKEND.
@@ -137,11 +157,14 @@ class NoOpReranker:
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     """Lifespan event handler to pre-load heavy embedding models and database clients."""
-    global embedder, retriever, reranker, store, catalogue
+    global embedder, retriever, reranker, store, catalogue, jd_filter
     logger.info("Initializing Shortlist microservice...")
     try:
         # Pre-load embedding model on CPU
         embedder = CVEmbedder()
+        # Strips company boilerplate from long job descriptions before embedding.
+        # None when JD_FILTER=false.
+        jd_filter = build_jd_filter(embedder)
         # Initialize database query client
         retriever = CVRetriever()
         # Reranking stage. Which backend is a deployment choice, not a code
@@ -181,7 +204,10 @@ def verify_api_key(api_key: str = Security(API_KEY_HEADER)):
             status_code=status.HTTP_401_UNAUTHORIZED,
             detail="Missing API Key. Provide it in the X-API-Key header."
         )
-    if api_key != expected:
+    # Constant-time comparison: `!=` returns at the first differing byte, which
+    # leaks how much of a guessed key was right. Encoded first because
+    # compare_digest rejects non-ASCII str, and a header can carry any bytes.
+    if not hmac.compare_digest(api_key.encode("utf-8"), expected.encode("utf-8")):
         raise HTTPException(
             status_code=status.HTTP_401_UNAUTHORIZED,
             detail="Invalid API Key."
@@ -195,7 +221,7 @@ def verify_api_key(api_key: str = Security(API_KEY_HEADER)):
     summary="Screen and Rerank Resume Candidates",
     description="Accepts a Job Description, retrieves candidates from Qdrant, applies filters, reranks them using an LLM, and returns top matches."
 )
-async def screen_resumes(request: ScreenRequest):
+def screen_resumes(request: ScreenRequest):
     global embedder, retriever, reranker
     
     if not embedder or not retriever or not reranker:
@@ -215,10 +241,24 @@ async def screen_resumes(request: ScreenRequest):
     # is what makes a latency regression attributable to a stage.
     timings = {}
 
+    # 0. Remove boilerplate. Real postings open with "About us" and end with
+    # benefits, which dilutes both the vector and the BM25 query (measured:
+    # -0.08 to -0.15 nDCG@5). Only the retrieval text changes; the reranker still
+    # receives the original job description. A failure here must never fail the
+    # search, so it degrades to the unfiltered text.
+    search_text = request.job_description
+    if jd_filter is not None:
+        try:
+            with stage_timer(timings, "filter_ms"):
+                search_text = jd_filter.apply(request.job_description)
+        except Exception as e:
+            logger.warning(f"JD filter failed ({e}); using the unfiltered text.")
+            search_text = request.job_description
+
     # 1. Embed job description text
     try:
         with stage_timer(timings, "embed_ms"):
-            jd_vector = embedder.embed_text(request.job_description)
+            jd_vector = embedder.embed_text(search_text)
     except Exception as e:
         logger.error(f"Failed to embed Job Description: {e}")
         raise HTTPException(
@@ -232,8 +272,10 @@ async def screen_resumes(request: ScreenRequest):
             retrieved_candidates = retriever.search_candidates(
                 query_vector=jd_vector,
                 filters=request.filters,
-                # Raw JD text drives the BM25 branch of hybrid retrieval.
-                query_text=request.job_description,
+                # The same text drives the BM25 branch of hybrid retrieval.
+                query_text=search_text,
+                # The pool must be at least as large as what the caller asked for.
+                at_least=top_k,
             )
     except Exception as e:
         logger.error(f"Error during Qdrant candidate retrieval: {e}")
@@ -267,13 +309,25 @@ async def screen_resumes(request: ScreenRequest):
         )
 
     # 4. Formulate response
+    # The reranker rebuilds each row from index metadata and carries no flags, so
+    # they are joined back on by id from what retrieval returned.
+    stuffed = {
+        c["candidate_id"] for c in retrieved_candidates if c.get("possible_stuffing")
+    }
+    too_close = {
+        c["candidate_id"] for c in retrieved_candidates if c.get("suspicious_match")
+    }
     candidate_matches = [
         CandidateMatch(
             candidate_id=item["candidate_id"],
             name=item["name"],
             score=item["score"],
             match_reasoning=item["match_reasoning"],
-            cv_path=item["cv_path"]
+            cv_path=item["cv_path"],
+            flags=(
+                (["possible_keyword_stuffing"] if item["candidate_id"] in stuffed else [])
+                + (["suspiciously_close_match"] if item["candidate_id"] in too_close else [])
+            ),
         ) for item in reranked_candidates
     ]
 
@@ -315,7 +369,7 @@ async def screen_resumes(request: ScreenRequest):
     summary="Health check endpoint",
     description="Ensures database connectivity, LLM API credentials presence, and local model load status."
 )
-async def health_check():
+def health_check():
     global embedder, retriever, reranker
     
     details = {
@@ -385,7 +439,7 @@ def _require_ready():
     tags=["Candidates"],
     summary="Browse the indexed candidate pool",
 )
-async def list_candidates(
+def list_candidates(
     limit: int = Query(50, ge=1, le=200),
     offset: int = Query(0, ge=0),
     location: str = Query(None, description="Exact city match, alias-normalised"),
@@ -415,7 +469,7 @@ async def list_candidates(
     tags=["Candidates"],
     summary="Summary of what is indexed",
 )
-async def pool_stats():
+def pool_stats():
     _require_ready()
     try:
         return catalogue.stats()
@@ -431,7 +485,7 @@ async def pool_stats():
     tags=["Candidates"],
     summary="One candidate, including the text that was indexed",
 )
-async def get_candidate(candidate_id: str):
+def get_candidate(candidate_id: str):
     _require_ready()
     record = catalogue.get_candidate(candidate_id)
     if not record:
@@ -445,7 +499,7 @@ async def get_candidate(candidate_id: str):
     tags=["Candidates"],
     summary="Download the candidate's original CV file",
 )
-async def get_candidate_cv(candidate_id: str):
+def get_candidate_cv(candidate_id: str):
     """Serve the original PDF/DOCX.
 
     The screening response carries a server-side `cv_path`, which a client
@@ -477,7 +531,7 @@ async def get_candidate_cv(candidate_id: str):
     tags=["Screenings"],
     summary="Previous screening runs, newest first",
 )
-async def list_screenings(
+def list_screenings(
     limit: int = Query(20, ge=1, le=100), offset: int = Query(0, ge=0)
 ):
     _require_ready()
@@ -494,7 +548,7 @@ async def list_screenings(
     tags=["Screenings"],
     summary="Reopen a screening run with its decisions",
 )
-async def get_screening(job_id: str):
+def get_screening(job_id: str):
     """Returns the stored results, not a fresh search.
 
     Re-running would cost another LLM call and could return a different order,
@@ -520,7 +574,7 @@ async def get_screening(job_id: str):
     tags=["Screenings"],
     summary="Shortlist, reject or flag a candidate",
 )
-async def set_decision(job_id: str, candidate_id: str, request: DecisionRequest):
+def set_decision(job_id: str, candidate_id: str, request: DecisionRequest):
     _require_ready()
     run = store.get_screening(job_id)
     if not run:
@@ -545,7 +599,7 @@ async def set_decision(job_id: str, candidate_id: str, request: DecisionRequest)
     tags=["Screenings"],
     summary="Export the shortlist as CSV",
 )
-async def export_shortlist(
+def export_shortlist(
     job_id: str,
     decision: str = Query("shortlisted", description="Which decision to export, or 'all'"),
 ):
@@ -578,12 +632,12 @@ async def export_shortlist(
             buffer.seek(0)
             buffer.truncate(0)
             writer.writerow([
-                candidate["name"],
-                candidate["candidate_id"],
+                csv_safe(candidate["name"]),
+                csv_safe(candidate["candidate_id"]),
                 f"{candidate['score']:.3f}",
                 record.get("decision", "undecided"),
-                record.get("note") or "",
-                candidate["match_reasoning"],
+                csv_safe(record.get("note") or ""),
+                csv_safe(candidate["match_reasoning"]),
             ])
             yield buffer.getvalue()
 

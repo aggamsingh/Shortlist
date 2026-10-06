@@ -83,7 +83,8 @@ property of how much retrieval left on the table, not of the reranker. See
 - [How it works](#how-it-works) — the pipeline, stage by stage
 - [Design decisions](#design-decisions) — what was chosen and what it cost
 - [Evaluation](#evaluation) — the benchmark, the dev/test split, and the bug in it
-- [Testing](#testing) — 298 tests and why the original 32 were worthless
+- [Stress testing](#stress-testing-what-broke-under-load-attack-and-realistic-input) — what broke under load, attack and realistic input
+- [Testing](#testing) — 404 tests and why the original 32 were worthless
 - [Configuration](#configuration) — every environment variable
 - [Limitations](#limitations) — what this does not do, stated plainly
 - [Next steps](#next-steps)
@@ -818,6 +819,303 @@ through. Retries are for per-minute limits only.
   faked.
 
 
+### Stress testing: what broke under load, attack and realistic input
+
+Everything above measures ranking quality on short, clean job descriptions
+against honest CVs. That is the easy case. This section is what happened when the
+*running* service was loaded, attacked and fed the text recruiters actually
+paste. **The test suite caught none of it**: each finding came from measuring the
+live system, and each fix has a regression test that was shown to fail without it.
+
+| # | Finding | Measured | Fix | Outcome |
+|---|---|---|---|---|
+| 1 | One slow request froze the whole server | `/health` took 2.4 s behind a 3 s search; six concurrent searches took 18.3 s, strictly one after another | handlers `async def` → `def`, so they run in a threadpool | `/health` 0.01 s; six searches in 3.2 s |
+| 2 | Real job postings lose ranking quality | hybrid nDCG@5 −0.08 to −0.15 when the same requirements sit inside company boilerplate | sentence filter before embedding | **+0.08 held-out, about 60% of the loss recovered** |
+| 3 | Pasting the job description into a CV wins | an irrelevant candidate ranked **first in 37 of 37** queries, through retrieval *and* the cross-encoder | verbatim-copy detector removes the chunk | neutralised: 0 of 37 first, 0 false flags |
+| 4 | …and shuffled keyword soup still wins | 37 of 37 first; the copy detector is blind to it | flagged, not removed | **not stopped**, only warned about |
+| 5 | The shipped candidate pool (30) was never the one measured (10) | at 30 the cross-encoder was worse and 3× slower | default is now 10 | see [Retrieval pool size](#retrieval-pool-size) |
+| 6 | The pool ignored `top_k` | a request for 50 results returned at most the pool | pool is `max(configured, top_k)` | fixed |
+| 7 | CSV export ran applicant text as spreadsheet formulas | names come from file names and CV text, so an applicant chooses them | leading `= + - @` cells are prefixed with `'` | fixed |
+| 8 | API key compared with `!=` | not constant-time; a non-ASCII header could have been a 500 | `hmac.compare_digest` on bytes | fixed |
+| 9 | `!!! ???` or an emoji string returned ten confidently ranked candidates | no content to match, but a normal-looking answer | rejected unless it contains a letter or digit | fixed |
+| 10 | The same CV saved under two names was indexed as two candidates | one person twice in a shortlist, with identical scores | content fingerprint; already-indexed file wins | fixed |
+| 11 | No size cap on a CV | one 120,000-word file became 700 chunks; a 600,000-word file stalled a run for 4 minutes | `MAX_CV_WORDS=20000`, cut with a warning | fixed |
+| – | Prompt injection against the LLM reranker | three injection styles; the planted candidate stayed 4th at 0.10–0.15 | none; prompt left unchanged | **no vulnerability found** (one model, three attempts) |
+| – | 63 hostile and malformed requests | oversize, null bytes, SQL, HTML, Unicode, wrong types, a 5 MB body | – | zero server errors |
+
+Every row above has a command to reproduce it, below.
+
+#### Concurrency and responsiveness
+
+```bash
+python -m evaluation.stress_server blocking       # slow reranker: does /health stall?
+python -m evaluation.stress_server concurrency    # 120 requests, 12 threads, vs a serial baseline
+```
+
+These drive a real uvicorn server over HTTP. `TestClient` cannot find this class of
+bug: it gives every call its own event loop, so it passes against exactly the
+defect. The handlers were `async def` but did blocking work, so FastAPI ran them
+*on* the event loop and one request stalled every other. A compose healthcheck
+with a 5 s timeout would have marked the container unhealthy during an LLM
+rate-limit backoff.
+
+Moving handlers onto threads makes the embedder, the embedded Qdrant client and
+torch inference concurrent for the first time, so correctness under concurrency
+needed its own test. Against the real embedder, cross-encoder, Qdrant and SQLite:
+
+| 120 concurrent requests, 12 threads | |
+|---|---|
+| errors | **0** |
+| results that differ from the serial baseline | **0** |
+| server-side errors in the log (tokenizer "Already borrowed", SQLite locked, tracebacks) | **0** |
+| `/health` with the pool saturated | 0.06 s |
+| 200 concurrent decision writes to one screening | 0 failed, all persisted |
+
+**Throughput is CPU-bound, and the pool size is what moves it.** Threads buy
+responsiveness, not throughput: torch inference already uses the cores. What
+changed throughput was the rerank pool. Run back to back in the same machine
+state (`--pool 30` then `--pool 10`, 60 requests, 12 threads):
+
+| | pool 30 | pool 10 |
+|---|---|---|
+| serial latency per request | 4.82 s | **1.14 s** |
+| concurrent throughput | 0.51 req/s | **1.37 req/s** |
+| errors, and results differing from the serial baseline | 0, 0 | 0, 0 |
+
+About 4× faster per request and 2.7× the throughput. **Quote the ratio, not the
+seconds:** this laptop's speed drifts by up to 2× between runs (the same
+pool-30 request took 1.96 s earlier the same day and 4.82 s here), so absolute
+latencies in this README are for orientation only and are only comparable within
+one run.
+
+#### Retrieval pool size
+
+The service retrieved 30 candidates for reranking by default. Every evaluation in
+this project used 10. The shipped configuration had never been measured, so it
+was measured (dev set, cross-encoder, `--budget 10` against `--budget 30`):
+
+| dev | pool | retrieval nDCG@5 | + cross-encoder nDCG@5 | + cross-encoder recall@5 | rerank time |
+|---|---|---|---|---|---|
+| cross-role | 10 | 0.890 | 0.942 | 0.863 | 541 ms |
+| cross-role | 30 | 0.890 | 0.933 | 0.838 | 1,575 ms |
+| within-role | 10 | 0.803 | 0.813 | 0.679 | 552 ms |
+| within-role | 30 | 0.803 | 0.806 | 0.631 | 1,714 ms |
+
+Retrieval-only results do not depend on pool size, as expected. A larger pool made
+the cross-encoder *worse* and about three times slower. On a 32-CV corpus a pool
+of 30 is nearly the whole corpus (pool recall reads 1.000 trivially), so retrieval
+does no filtering at all. The default is now **10**, the configuration with
+evidence behind it. A larger pool belongs with a much larger corpus and a fresh
+measurement, not a guess. A request asking for a bigger `top_k` still gets a pool
+at least that large.
+
+**Changing a default does nothing for an existing setup.** After the default moved
+to 10, a real request still logged `retrieved=30`: the local `.env`, copied from the
+old `.env.example`, pinned `RETRIEVAL_CANDIDATES=30`, and the Docker stack loads
+that file too. Every setup created before this change had the same pin. The service
+now logs a warning whenever the pool differs from the evaluated 10, naming the likely
+cause; if you have an older `.env`, change that line.
+
+#### Realistic job descriptions
+
+The labelled queries are 30 to 60 tokens of pure requirements. Real postings are
+300 to 800 tokens and open with "About us". Wrapping the *same* requirements in
+company boilerplate (written in three independent styles; `evaluation/jd_styles.py`)
+and measuring hybrid retrieval:
+
+| hybrid nDCG@5 | cross-role | within-role |
+|---|---|---|
+| dev, clean job descriptions | 0.890 | 0.803 |
+| dev, style B boilerplate | 0.751 | 0.633 |
+| dev, style B + **filter** | **0.884** | **0.782** |
+| held-out, clean job descriptions | 0.896 | 0.725 |
+| held-out, style C boilerplate | 0.773 | 0.577 |
+| held-out, style C + **filter** | **0.855** | **0.654** |
+
+```bash
+python -m evaluation.run_eval --split dev  --jd-style B                 # then add --jd-filter
+python -m evaluation.run_eval --split test --jd-style C                 # then add --jd-filter
+```
+
+**It was not truncation.** MiniLM reads 256 tokens, but most wrapped variants stayed
+under that. Generic company prose simply dilutes the dense vector and the BM25
+query; even modest padding cost 0.07 to 0.10 nDCG.
+
+**What failed:** retrieving per chunk of the posting and fusing the lists, the
+obvious generic fix, collapsed to nDCG 0.38 to 0.44 against 0.70 to 0.77 for the
+whole-text approach (styles B and A), because boilerplate is most of the chunks and each noise chunk retrieves
+its own noise list.
+
+**What works:** score each sentence by whether it reads more like a role
+requirement or like company and benefits text (two fixed prototype phrases, written
+before any result), and keep the former. One threshold was chosen on dev styles A
+and B. Style C was written independently afterwards and run once, on held-out
+queries, with no change on clean job descriptions (−0.001). `evaluation/jd_styles.py`
+refuses style C on the dev split so the confirmation cannot be spent by accident.
+
+**Limits, stated plainly.** It recovers about 60% of the loss, not all of it. The
+threshold is fragile: 0.0 was *worse* than no filter on one style. The three styles
+are my own writing, not a sample of real postings, so they show that boilerplate
+hurts and that a filter helps, not by how much on real data. Only retrieval uses
+the filtered text; the reranker still sees the original.
+
+#### Keyword stuffing
+
+An applicant pastes the job description into their CV, often in white text. One
+irrelevant candidate per query did exactly that:
+
+```bash
+python -m evaluation.attack_stuffing dev
+python -m evaluation.attack_stuffing test      # held-out; read once
+```
+
+| dev, 37 queries (in top 5 / ranked first) | retrieval | + cross-encoder |
+|---|---|---|
+| no attack | 1 / 0 | 3 / 0 |
+| verbatim copy, no defence | **37 / 37** | **37 / 37** |
+| verbatim copy, defence on | 1 / 0 | 5 / 0 |
+| keyword soup, no defence | 37 / 37 | 37 / 36 |
+| keyword soup, defence on | 37 / 37 | 37 / 36 |
+
+The held-out queries agree: verbatim copy 17/17 → 2/0, keyword soup unchanged at
+17/17, **zero false flags** on both splits.
+
+The cross-encoder is not a defence. My first measurement, which fed it the whole
+CV, suggested it resisted the attack (28 of 37). In the serving path it reads the
+retrieved chunk, which *is* the pasted job description, and it was fooled 37 of 37.
+
+**What stops it.** A legitimate chunk shares at most 2 four-word phrases with a job
+description (at most 12% of its 4-grams); a pasted copy shares all of them.
+Chunks that copy the job description are removed from the candidate's score and
+from what the reranker sees, and the candidate is flagged
+`possible_keyword_stuffing`.
+
+**What does not.** Shuffling the job description's words into a keyword list leaves
+no phrase to match, and still wins every query. The obvious second signal, how many
+of the job description's words appear, cannot separate it either: a legitimate
+strong chunk covers up to 93% of them. What does separate it is embedding
+closeness. Real CV chunks never exceeded cosine 0.685 (dev) and 0.620 (held-out) to
+the job description; keyword soup started at 0.758 and 0.738. Chunks above 0.72
+are flagged `suspiciously_close_match` but **not removed**, because an honest CV
+tailored to a posting can score high too. The flag caught 36 of 37 soup attacks on
+dev and 16 of 17 held-out. The candidate still ranks first. The recruiter is
+warned; the ranking is not fixed. The margin on the attack side is 0.018, and
+diluting the soup with filler walks under the threshold.
+
+What would close it needs signals this project does not have: parse-time detection
+of hidden text (white or tiny font), or a coherence check on the chunk. Neither is
+built. **Treat the defence as removing the laziest version of the attack and warning
+about the next, not as solving it.** An empty `flags` list is not a guarantee.
+
+#### Prompt injection
+
+The LLM reranker reads untrusted CV text inside its prompt, with no delimiters and
+no instruction to distrust it. A cloud architect, irrelevant to a React role, had
+three injections appended to their resume: an instruction to the scoring assistant,
+"ignore all previous instructions", and a forged JSON ranking. `gpt-oss-120b`
+ignored all three: the candidate stayed 4th with a score of 0.10 to 0.15 and the
+reasoning described them as an unrelated cloud architect.
+
+**This is a result, not a guarantee.** One model, three variants, one run each.
+Smaller models, other providers and adaptive attacks are untested. The prompt was
+deliberately **not** hardened: every LLM figure in this README was measured with the
+current prompt and the free quota cannot re-measure them, so changing it would mean
+shipping something unmeasured. Hardening it (delimiters and an explicit
+untrusted-data rule) is a recommended next step, to be done together with a
+re-measurement.
+
+#### Hostile input
+
+63 requests: empty and whitespace job descriptions, one character, punctuation
+only, emoji only, Hindi, Arabic, CJK, null bytes, control characters, 20,000 and
+20,001 characters, a single 5,000-character word, HTML and script tags, SQL, format
+strings, `top_k` of 0, -1, 101, a string and a float, out-of-range and mistyped
+filters, a 5 MB body, path traversal in IDs, oversized pagination and notes.
+**Zero server errors**: malformed input gets 422, unknown IDs 404, a candidate
+outside the run 400.
+
+#### Scale
+
+```bash
+python -m evaluation.stress_scale 500 2000
+```
+
+A synthetic corpus of N CVs through the real indexer and retriever, in the default
+embedded-Qdrant mode. **Timing only**: the corpus is the 32 labelled documents
+repeated with different names and cities, so this says nothing about retrieval
+quality at scale.
+
+| CVs | full index | re-run, nothing changed | **+1 new file** | retrieve p50 | Qdrant on disk |
+|---|---|---|---|---|---|
+| 32 | – | – | – | ~6 ms | – |
+| 500 | 125 s | 56 s | 53 s | 309 ms | 8.3 MB |
+| 2,000 | 283 s | 97 s | **109 s** | **990 ms** | 33.2 MB |
+
+**Retrieval latency grows linearly, about 0.5 ms per CV, and is already 1 s at
+2,000 CVs.** Where the time goes at 2,000 CVs (4,002 points, p50):
+
+| | ms |
+|---|---|
+| hybrid retrieval as shipped | 992 |
+| dense branch alone | 170 |
+| **BM25 branch alone** | **616** |
+| dense branch returning vectors | 264 (+94) |
+| stuffing check, on versus off | +33 |
+
+The BM25 branch is two thirds of it: embedded Qdrant scores sparse vectors in a
+Python loop. A Qdrant server keeps an inverted index and should not behave this
+way, but **that was not measured**: the Docker daemon was not running when this was
+tested, so "server mode fixes it" is an expectation, not a result.
+
+The stuffing defence is not free. Returning vectors for the stuffing check costs
+about 94 ms and the check itself about 33 ms: roughly 13% of retrieval at 2,000 CVs
+in embedded mode. That is a real cost, paid for the 37-of-37 attack it blocks.
+
+**Adding a single CV to a 2,000-CV corpus took 109 seconds**, 38% of a full index,
+and a re-run with nothing changed took 97. Every run parses every file, refits BM25
+over the whole corpus and rewrites the sparse vectors of every unchanged point,
+because a document's BM25 weights depend on corpus-wide statistics. Indexing is
+O(corpus) per run, not O(change). That is fine for a nightly batch and unusable for
+an upload endpoint, and it is the main thing standing between this and the
+upload-and-search UI: it needs running document-frequency counts so one new CV
+touches one CV's worth of data.
+
+A 6,000-CV run was started and abandoned unfinished. Two sizes show the trend; a
+third would add extrapolation confidence, not information.
+
+
+#### Hostile files
+
+Twenty awkward files through the real indexer: corrupt and zero-byte `.docx` and
+`.pdf`, a truncated PDF, a blank scan with no text layer, empty and whitespace-only
+documents, `.doc`, `.txt` and extensionless files, uppercase extensions, Unicode and
+emoji in file names, a 180-character name, the same file name in two folders, and a
+CV of twenty words. **The indexer exits 0, skips each bad file with a logged reason,
+indexes the valid ones, and creates no duplicates on a second run.**
+
+Two gaps were real and are fixed. A CV saved twice (under different names, or
+re-saved so the bytes differ) was indexed as two candidates; the file hash cannot see
+that, so duplicates are now detected by a fingerprint of the normalised *text*, and
+the file already in the index is kept so that adding a later copy cannot displace it.
+And there was no size cap, so one oversized file could stall indexing and flood the
+index; files over `MAX_CV_WORDS` are cut with a warning.
+
+Image-only PDFs are skipped, not read: there is no OCR.
+
+#### What stress testing did not cover
+
+- Shuffled keyword soup is flagged, not stopped.
+- Hidden-text detection in PDF and DOCX files is not built.
+- The boilerplate styles are my own writing, not real postings, and the filter
+  recovers about 60% of the loss.
+- Prompt injection was tested on one model with three variants.
+- Absolute latencies drift by up to 2x between runs on this machine; only same-run ratios are reliable.
+- Everything runs on CPU, and no GPU configuration was measured.
+- Server-mode Qdrant latency was not measured (no Docker daemon), and the scale
+  corpus repeats 32 documents, so retrieval quality at scale is untested.
+- There is no rate limiting and no per-user authentication, and the API is open if
+  `API_KEY` is unset.
+
 ### Reproducing this
 
 Add a key to `.env` and verify it first:
@@ -849,7 +1147,7 @@ invalid key, so you can tell the two apart immediately.
 ## Testing
 
 ```bash
-python -m unittest discover -s tests -t . -v      # 298 tests
+python -m unittest discover -s tests -t . -v      # 404 tests
 ```
 
 Qdrant runs embedded, so the end-to-end tests need no server and run in CI.
@@ -876,9 +1174,12 @@ Every value lives in `.env` — see `.env.example` for the annotated list. The o
 | `GEMINI_API_KEY` / `GROQ_API_KEY` | — | At least one enables LLM reranking. Gemini is tried first, Groq is the fallback. |
 | `RERANKER_BACKEND` | `llm` | `llm`, `cross-encoder` (local, no key) or `none`. See [Reranker evaluation](#reranker-evaluation-three-ways). |
 | `CROSS_ENCODER_MODEL` | `cross-encoder/ms-marco-MiniLM-L-6-v2` | Cross-encoder weights, downloaded once (~90MB) and cached. |
+| `JD_FILTER` / `JD_FILTER_THRESHOLD` | `true` / `-0.05` | Strip company boilerplate from job descriptions before embedding. See [Realistic job descriptions](#realistic-job-descriptions). |
+| `STUFFING_DEFENSE` | `true` | Remove CV chunks that copy the job description and flag the candidate. See [Keyword stuffing](#keyword-stuffing). |
+| `STUFFING_OVERLAP_THRESHOLD` / `STUFFING_COSINE_THRESHOLD` | `0.30` / `0.72` | Copy detection threshold; and the cosine above which a chunk is flagged but kept. |
 | `QDRANT_PATH` | — | Run Qdrant embedded from this directory (no server). |
 | `QDRANT_HOST` / `QDRANT_PORT` | `localhost` / `6333` | Qdrant server, when not embedded. |
-| `RETRIEVAL_CANDIDATES` | `30` | Distinct **candidates** retrieved for reranking (not chunks). |
+| `RETRIEVAL_CANDIDATES` | `10` | Distinct **candidates** retrieved for reranking (not chunks). `10` is the pool the evaluation measured; a larger `top_k` in a request enlarges the pool to match. See [Retrieval pool size](#retrieval-pool-size). |
 | `MAX_CHARS_PER_CANDIDATE` | `1200` | Cap on resume text per candidate sent to the LLM. |
 
 ---
@@ -889,15 +1190,18 @@ Known and deliberate, rather than hidden:
 
 - **Metadata extraction still leans on regex first.** That is deliberate (see above), but the regex path itself is unchanged: years from phrases like "5 years of experience", location from eleven hardcoded Indian cities, name from the filename. The LLM fallback covers the failures rather than improving the fast path, and its accuracy has been checked on a handful of CVs, not measured across a labelled set.
 - **Location filtering is exact-match on a guessed city.** No geocoding, no radius, no remote handling.
-- **The evaluation corpus is synthetic and small.** Real resumes cannot be committed to a public repo, but these fixtures are cleaner and more uniformly structured than real CVs, so the absolute numbers are optimistic. The *relative* comparisons between configurations are the useful part.
+- **The evaluation corpus is synthetic and small.** Real resumes cannot be committed to a public repo, but these fixtures are cleaner and more uniformly structured than real CVs, so the absolute numbers are optimistic. The *relative* comparisons between configurations are the useful part. The job descriptions are optimistic too: 30 to 60 tokens of pure requirements, where real postings are 300 to 800 tokens of mostly company text. The [boilerplate styles](#realistic-job-descriptions) used to test that are my own writing, not a sample of real postings.
 - **No OCR.** Scanned image-only PDFs extract no text and are skipped with a warning.
-- **Reranker latency dominates and is not optimised.** Measured: embed 12–51 ms, retrieve 1.3–2.6 ms, rerank 1505–2113 ms — about 97% of request time, for only 3 candidates. It has not been measured with a full 30-candidate shortlist, and there is no batching, caching or timeout tuning.
+- **Reranking dominates request time.** Measured on the 32-CV index (medians): embed about 8 ms, retrieve about 6 ms. The cross-encoder costs about 0.55 s at a pool of 10 and about 1.65 s at 30; one LLM call took 1.5–2.1 s when measured once, and about 25 s per request while a free tier was throttling. Throughput is CPU-bound: 1.37 requests/s with the cross-encoder at a pool of 10 and 0.51 at 30, on this laptop, 12 threads. There is no batching, caching or timeout tuning.
 - **Model ids drift.** The Groq default is `openai/gpt-oss-120b`, verified working; the previous `llama-3.3-70b-versatile` now 404s. The Gemini default `gemini-2.5-flash` is **unverified** — no Gemini key was tested. Both are configurable via `GEMINI_MODEL` / `GROQ_MODEL`.
 - **Results are from one model on a small corpus.** The reranker numbers come from a single provider (Groq `openai/gpt-oss-120b`) over the *original* 15 dev queries and 32 synthetic CVs, and the +0.03 lift rests on one mostly-clean run. They show the pipeline works and that retrieval quality erodes the reranker's margin; they are not a general claim about reranking.
 - **Every reranker figure is a single run.** The LLM runs at `temperature=0` and the cross-encoder is deterministic, so the models do not vary — but there are no error bars, and one within-role dev cell is missing entirely because a daily quota ran out mid-measurement.
 - **Reranking is compared across two specific models**, `openai/gpt-oss-120b` and `ms-marco-MiniLM-L-6-v2`. These are not general claims about LLMs versus cross-encoders.
 - **The cross-encoder's scores are uncalibrated.** Ordering is meaningful; the absolute 0–1 value is a sigmoid of a relevance logit, not a percentage match, and it is sensitive to how long the matched passage is.
 - **17 held-out queries is a thin test set.** It is enough to show a 0.22 nDCG effect and not enough to resolve a 0.05 one — as demonstrated when its 8 within-role queries ranked the shipped chunker third, and 17 dev queries then put it first. Treat the chunker ordering in the held-out table as noise, and single-digit differences anywhere in this README as undetermined.
+- **Keyword stuffing is only partly defended.** Pasting the job description verbatim is neutralised; a shuffled keyword list still ranks first and is only *flagged*. There is no hidden-text detection (white or tiny font) in PDF or DOCX files. An empty `flags` list is not a guarantee. See [Keyword stuffing](#keyword-stuffing).
+- **Job-description cleanup recovers about 60% of what boilerplate costs**, its threshold is fragile, and only retrieval uses the cleaned text: the reranker still reads the original.
+- **No rate limiting and no per-user authentication.** One shared API key, compared in constant time, protects everything; the API is open if `API_KEY` is unset. That is unsuitable for a browser UI, where a shared key would be visible to every user.
 - **Relevance labels are author-assigned.** One person graded all 54 queries, with no second annotator and no inter-rater agreement measured. The grades encode a defensible reading of each role, not a consensus one.
 
 ## Next steps

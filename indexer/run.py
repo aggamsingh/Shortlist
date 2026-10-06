@@ -20,6 +20,8 @@ from indexer.parser import (
     chunk_resume,
     normalize_location,
     COMMON_CITIES,
+    content_fingerprint,
+    truncate_words,
 )
 from indexer.embedder import CVEmbedder
 from indexer.sparse import BM25Encoder
@@ -64,6 +66,9 @@ def word_boundary(term: str) -> str:
 # own location lives here; cities further down usually belong to an employer or
 # a university.
 CONTACT_BLOCK_LINES = 6
+# Longest CV, in words, that is indexed in full. Longer files are cut with a
+# warning. 0 disables the cap.
+MAX_CV_WORDS = int(os.getenv("MAX_CV_WORDS", "20000"))
 
 
 def extract_location(text: str) -> str:
@@ -220,6 +225,13 @@ def main():
             else:
                 logger.warning(f"Skipping file {file} with unsupported extension '{ext}'")
 
+    # Already-indexed files first, then alphabetical. Order matters for duplicate
+    # handling below: the file that is already in the index must be the one that
+    # is kept, or adding a later copy would displace it and leave its old vectors
+    # behind. Sorting also makes the choice deterministic rather than whatever order
+    # the filesystem happened to list.
+    cv_files.sort(key=lambda path: (path not in state, path))
+
     logger.info(f"Found {len(cv_files)} candidate CV files to check.")
 
     # 6. Pass one: parse and chunk everything.
@@ -231,6 +243,7 @@ def main():
     # entirely and this becomes the original single-pass behaviour.
     metadata = MetadataExtractor(cache_path=METADATA_CACHE_PATH)
     parsed = {}
+    seen_content = {}
     for file_path in cv_files:
         filename = os.path.basename(file_path)
         try:
@@ -253,6 +266,25 @@ def main():
         if not cv_text.strip():
             logger.warning(f"Parsed CV text is empty for {filename}, skipping.")
             continue
+
+        cv_text, truncated = truncate_words(cv_text, MAX_CV_WORDS)
+        if truncated:
+            logger.warning(
+                f"{filename} exceeds MAX_CV_WORDS={MAX_CV_WORDS}; indexing only its "
+                "first words. A real CV is far shorter, so this is more likely a "
+                "wrong file or an attempt to flood the index."
+            )
+
+        # The same CV saved twice would appear twice in every shortlist, as two
+        # different candidates with identical scores.
+        fingerprint = content_fingerprint(cv_text)
+        if fingerprint in seen_content:
+            logger.warning(
+                f"{filename} has the same text as {seen_content[fingerprint]}; "
+                "skipping the duplicate."
+            )
+            continue
+        seen_content[fingerprint] = filename
 
         relative_path = os.path.relpath(file_path, CV_FOLDER_PATH)
         # Regex first; the LLM is consulted only for fields it could not resolve,

@@ -1,3 +1,4 @@
+import re
 from typing import List, Optional
 from uuid import UUID
 
@@ -42,6 +43,11 @@ class ScreenRequest(BaseModel):
         """
         if not value.strip():
             raise ValueError("job_description must not be blank")
+        # "!!! ???" and an emoji string are not blank, but they carry no content to
+        # match on. Without this they returned ten confidently ranked candidates.
+        # \w is Unicode-aware, so Hindi, Arabic and CJK text still passes.
+        if not re.search(r"\w", value):
+            raise ValueError("job_description must contain at least one letter or digit")
         return value.strip()
 
 
@@ -57,6 +63,19 @@ class CandidateMatch(BaseModel):
         ..., description="A concise explanation of why the candidate matches"
     )
     cv_path: str = Field(..., description="Path to the candidate's original resume file")
+    flags: List[str] = Field(
+        default_factory=list,
+        description=(
+            "Warnings a recruiter should see before trusting this ranking. "
+            "'possible_keyword_stuffing': part of this CV copies the job "
+            "description verbatim; that part was excluded from scoring. "
+            "'suspiciously_close_match': a chunk is far closer to the job "
+            "description than any real CV chunk measured, which is what shuffled "
+            "keyword lists look like; it is flagged but NOT excluded, because an "
+            "honest tailored CV can score high too. Neither is a guarantee: an "
+            "empty list does not mean the CV is clean."
+        ),
+    )
 
 
 class ScreenResponse(BaseModel):

@@ -52,6 +52,26 @@ class RequestValidationTest(unittest.TestCase):
         """min_length alone would accept '   ' and embed meaningless input."""
         self.assertEqual(self.post({"job_description": "    "}).status_code, 422)
 
+    def test_job_description_with_no_letters_or_digits_rejected(self):
+        """'!!! ???' and an emoji string are not blank, but have nothing to match
+        on. Before this check they returned ten confidently ranked candidates."""
+        for text in ("!!! ??? ...", ",,, ;;;", "🚀🚀🚀🔥💯", "- - - -", "​​"):
+            self.assertEqual(self.post({"job_description": text}).status_code, 422, repr(text))
+
+    def test_non_latin_scripts_are_accepted(self):
+        """\\w is Unicode-aware: rejecting 'no letters' must not reject Hindi,
+        Arabic or CJK, which are letters."""
+        for text in (
+            "हमें एक अनुभवी पायथन डेवलपर चाहिए",
+            "مطور بايثون خبير في قواعد البيانات",
+            "経験豊富なPythonバックエンドエンジニア",
+        ):
+            self.assertEqual(self.post({"job_description": text}).status_code, 200, text)
+
+    def test_digits_alone_are_accepted(self):
+        """A deliberate boundary: it has content to match on, however little."""
+        self.assertEqual(self.post({"job_description": "12345"}).status_code, 200)
+
     def test_embedder_not_called_for_invalid_input(self):
         """Validation must reject before any expensive work happens."""
         main_module.embedder.embed_text.reset_mock()

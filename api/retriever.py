@@ -3,6 +3,7 @@ import os
 from qdrant_client import QdrantClient
 from qdrant_client.http import models
 
+from api import stuffing
 from api.models import ScreeningFilters
 from indexer.utils import connect_qdrant, get_logger
 from indexer.parser import normalize_location
@@ -12,6 +13,10 @@ logger = get_logger("api.retriever")
 
 # Must match the name the indexer writes; see indexer/run.py.
 SPARSE_VECTOR_NAME = "text"
+# The dense vector is the collection's unnamed default; the indexer defines the same.
+DENSE_VECTOR_NAME = ""
+# The candidate pool every evaluation in this project used.
+EVALUATED_POOL = 10
 
 
 class CVRetriever:
@@ -33,9 +38,24 @@ class CVRetriever:
 
         # How many distinct candidates to pull back for reranking. RETRIEVAL_TOP_N
         # is the historical name for this knob and is still honoured.
+        #
+        # Defaults to 10 because that is the pool every evaluation in this project
+        # used. It used to default to 30, which was never measured: on dev, a pool
+        # of 30 made the cross-encoder worse (within-role recall@5 0.679 -> 0.631)
+        # and ~3x slower (550ms -> 1650ms). The README has the table.
         self.retrieval_candidates = int(
-            os.getenv("RETRIEVAL_CANDIDATES", os.getenv("RETRIEVAL_TOP_N", "30"))
+            os.getenv("RETRIEVAL_CANDIDATES", os.getenv("RETRIEVAL_TOP_N", "10"))
         )
+        # A pool other than the evaluated one is a deliberate departure, and the
+        # usual cause is a stale .env copied from an old .env.example: the default
+        # moved from 30 to 10 and an existing .env keeps overriding it silently.
+        if self.retrieval_candidates != EVALUATED_POOL:
+            logger.warning(
+                f"RETRIEVAL_CANDIDATES={self.retrieval_candidates}, but every "
+                f"evaluation used {EVALUATED_POOL}. A larger pool made the "
+                "cross-encoder worse and slower on the dev set (see the README); "
+                "re-measure before relying on it."
+            )
         # Best-matching chunks kept per candidate to build its summary.
         self.chunks_per_candidate = int(os.getenv("CHUNKS_PER_CANDIDATE", "3"))
 
@@ -108,6 +128,7 @@ class CVRetriever:
         filters: ScreeningFilters,
         top_n: int = None,
         query_text: str = None,
+        at_least: int = 0,
     ) -> list[dict]:
         """Return up to ``top_n`` distinct candidates ranked by best chunk score.
 
@@ -118,6 +139,9 @@ class CVRetriever:
         """
         if top_n is None:
             top_n = self.retrieval_candidates
+        # A caller asking for more results than the configured pool must not be
+        # silently capped: top_k=50 against a pool of 10 would return 10.
+        top_n = max(top_n, at_least)
 
         query_filter = self._build_filter(filters)
         sparse_query = self._sparse_query(query_text)
@@ -148,6 +172,9 @@ class CVRetriever:
                     limit=top_n,
                     group_size=self.chunks_per_candidate,
                     with_payload=True,
+                    # Dense vectors let the stuffing check measure how close each
+                    # chunk is to the job description (see api/stuffing.py).
+                    with_vectors=True,
                 )
             else:
                 logger.info(
@@ -162,10 +189,20 @@ class CVRetriever:
                     group_size=self.chunks_per_candidate,
                     query_filter=query_filter,
                     with_payload=True,
+                    # Dense vectors let the stuffing check measure how close each
+                    # chunk is to the job description (see api/stuffing.py).
+                    with_vectors=True,
                 )
         except Exception as e:
             logger.error(f"Error querying Qdrant: {e}")
             raise
+
+        # Chunks that reproduce the job description are keyword stuffing: pasting
+        # the posting into a CV put an irrelevant candidate first in 37 of 37 dev
+        # queries. They are removed from scoring and from what the reranker sees.
+        query_shingles = (
+            stuffing.shingles(query_text) if query_text and stuffing.enabled() else frozenset()
+        )
 
         candidates = []
         for group in response.groups:
@@ -173,13 +210,46 @@ class CVRetriever:
             if not hits:
                 continue
 
+            flagged = False
+            if query_shingles:
+                clean = [
+                    h for h in hits
+                    if not stuffing.is_copy(query_shingles, h.payload.get("chunk_text", ""))
+                ]
+                flagged = len(clean) < len(hits)
+                if flagged:
+                    logger.warning(
+                        f"Possible keyword stuffing: {hits[0].payload.get('name', '?')} has "
+                        f"{len(hits) - len(clean)} chunk(s) copying the job description; "
+                        "excluded from scoring."
+                    )
+            else:
+                clean = hits
+
+            # A chunk far closer to the job description than any real CV chunk ever
+            # is (measured max 0.685 against soup min 0.738) is flagged, not
+            # removed: an honest tailored CV can score high too.
+            suspicious = False
+            if stuffing.enabled():
+                for h in clean:
+                    vector = h.vector.get(DENSE_VECTOR_NAME) if isinstance(h.vector, dict) else h.vector
+                    if stuffing.is_suspiciously_close(query_vector, vector):
+                        suspicious = True
+                        logger.warning(
+                            f"Suspiciously close match: {h.payload.get('name', '?')} "
+                            "has a chunk unusually similar to the job description."
+                        )
+                        break
+
             # query_points_groups returns hits ordered best-first within a group.
-            best = max(hits, key=lambda h: h.score)
+            # With every retrieved chunk a copy there is nothing legitimate left to
+            # score, so identity comes from the raw hits and the score is zero.
+            best = max(clean or hits, key=lambda h: h.score)
             payload = best.payload
 
             # Preserve chunk order by relevance, dropping empties and duplicates.
             seen, chunk_texts = set(), []
-            for h in sorted(hits, key=lambda h: h.score, reverse=True):
+            for h in sorted(clean, key=lambda h: h.score, reverse=True):
                 text = (h.payload or {}).get("chunk_text", "").strip()
                 if text and text not in seen:
                     seen.add(text)
@@ -196,7 +266,9 @@ class CVRetriever:
                     # directly when the reranker is unavailable, and the schema
                     # requires 0-1. Cosine is already bounded, but RRF fusion
                     # scores are a different quantity with no such guarantee.
-                    "score": max(0.0, min(1.0, float(best.score))),
+                    "score": max(0.0, min(1.0, float(best.score))) if clean else 0.0,
+                    "possible_stuffing": flagged,
+                    "suspicious_match": suspicious,
                     "resume_summary": "\n---\n".join(chunk_texts),
                 }
             )
