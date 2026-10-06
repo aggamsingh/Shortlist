@@ -31,6 +31,7 @@ from api.models import (
     ScreeningHistory,
 )
 from api.retriever import CVRetriever
+from api.cross_encoder import CrossEncoderReranker
 from api.reranker import CVReranker
 from api.store import ScreeningStore
 
@@ -75,6 +76,64 @@ reranker = None
 store = None
 catalogue = None
 
+def build_reranker():
+    """Pick the reranking backend from RERANKER_BACKEND.
+
+    Defaults to `llm`, which is what the service already did -- a new default
+    would silently change every existing deployment's results.
+
+    `none` is a supported choice rather than an error case: reranking
+    measurably *hurts* on queries that retrieval already gets right, so running
+    hybrid retrieval alone is a legitimate configuration, not a broken one.
+    """
+    backend = os.getenv("RERANKER_BACKEND", "llm").strip().lower()
+
+    if backend in ("cross", "cross-encoder", "cross_encoder"):
+        reranker = CrossEncoderReranker()
+        if reranker.is_configured:
+            logger.info("Reranking backend: local cross-encoder.")
+            return reranker
+        # Falling through to the LLM would make the service quietly ignore an
+        # explicit configuration choice, so this is reported loudly instead.
+        logger.error(
+            "RERANKER_BACKEND=cross-encoder but the model could not be loaded; "
+            "ranking will degrade to retrieval order."
+        )
+        return reranker
+
+    if backend in ("none", "off", "retrieval"):
+        logger.info("Reranking backend: none (hybrid retrieval order is final).")
+        return NoOpReranker()
+
+    if backend != "llm":
+        logger.warning(f"Unknown RERANKER_BACKEND '{backend}'; falling back to llm.")
+    logger.info("Reranking backend: LLM.")
+    return CVReranker()
+
+
+class NoOpReranker:
+    """Keeps retrieval order, in the shape the rest of the service expects.
+
+    A null object rather than `None` checks scattered through the request path:
+    the endpoint already handles a reranker that declines to score, so reusing
+    that path is less code and less risk than a second branch.
+    """
+
+    is_configured = False
+
+    def rerank(self, jd: str, candidates: list, top_k: int) -> list:
+        return [
+            {
+                "candidate_id": c["candidate_id"],
+                "name": c.get("name", "Unknown"),
+                "score": float(c.get("score", 0.0)),
+                "match_reasoning": "Vector-similarity match (not scored by reranker).",
+                "cv_path": c.get("cv_path", ""),
+            }
+            for c in sorted(candidates, key=lambda c: -float(c.get("score", 0.0)))
+        ][:top_k]
+
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     """Lifespan event handler to pre-load heavy embedding models and database clients."""
@@ -85,8 +144,11 @@ async def lifespan(app: FastAPI):
         embedder = CVEmbedder()
         # Initialize database query client
         retriever = CVRetriever()
-        # Initialize reranking clients
-        reranker = CVReranker()
+        # Reranking stage. Which backend is a deployment choice, not a code
+        # change: the LLM reads the job description properly but costs an API
+        # call and ~1.5s, while the local cross-encoder is free and ~0.6s.
+        # Measured trade-offs are in the README.
+        reranker = build_reranker()
         # Screening history and recruiter decisions
         store = ScreeningStore()
         # Read-only views over the indexed pool, sharing the retriever's client
@@ -279,6 +341,11 @@ async def health_check():
     # reported as a working LLM configuration.
     if reranker and reranker.is_configured:
         details["llm_configured"] = True
+    if reranker is not None:
+        # Which backend is running is operationally important: an identical
+        # request returns different orderings under each one, so a bug report
+        # without this field is not reproducible.
+        details["reranker_backend"] = type(reranker).__name__
         
     # If core systems are broken, flag response as HTTP 503
     if details["status"] == "unhealthy" or not details["model_loaded"]:

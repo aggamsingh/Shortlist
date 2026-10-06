@@ -138,7 +138,15 @@ class EvalHarnessTest(unittest.TestCase):
         Grouping must surface at least as many relevant candidates as flat
         chunk retrieval at the same budget. If this ever regresses, the README's
         justification for grouped retrieval is no longer true.
+
+        Builds its own section index rather than inheriting whatever the
+        previous test left behind: the effect only exists under section
+        chunking (window chunking has ~2 chunks per CV, so flat is already
+        nearly distinct), and other tests in this class end by rebuilding with
+        `window`. Relying on setUpClass made this pass in alphabetical order
+        and fail in reverse.
         """
+        run_eval.build_index(self.client, self.embedder, run_eval.CHUNKERS["section"])
         flat = run_eval.evaluate_config(
             self.client, self.embedder, "flat", budget=10, k=5, queries=HARD_QUERIES
         )

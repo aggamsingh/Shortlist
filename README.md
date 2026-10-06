@@ -31,7 +31,7 @@ job description ──> embed ────────────────�
                                                     shortlist (N distinct people)
                                                                  │
                                                                  ▼
-                                                    LLM rerank (Groq / Gemini)
+                                     rerank: LLM | cross-encoder | none
                                                                  │
                                                                  ▼
                                                   scored candidates + reasoning
@@ -49,8 +49,13 @@ Within-role, k=5, budget=10:
 | | dev recall@5 | dev nDCG@5 | **test** recall@5 | **test** nDCG@5 |
 |---|---|---|---|---|
 | dense vectors only | 0.609 | 0.662 | 0.402 | 0.502 |
-| **+ hybrid BM25 retrieval** | **0.719** | **0.803** | **0.594** | **0.725** |
-| + LLM reranking | see below | see below | not yet measured | not yet measured |
+| **+ hybrid BM25 retrieval** | **0.719** | **0.803** | 0.594 | 0.725 |
+| + local cross-encoder | 0.679 | 0.813 | 0.615 | 0.768 |
+| + LLM reranking | — ¹ | — ¹ | **0.692** | **0.847** |
+
+¹ Not measured: Groq's free tier daily quota ran out mid-run and the harness
+flagged the row rather than averaging over failures. See
+[The missing cell](#the-missing-cell).
 
 Three things to read off this table:
 
@@ -65,10 +70,12 @@ system. The held-out set is what the system scores on job descriptions it was
 not shaped around — see
 [Held-out results](#held-out-results-the-honest-numbers).
 
-**Reranking has never been measured on held-out queries.** Its dev lift was
-+0.03 nDCG on an earlier, smaller dev set, and it actively *hurts* on easy
-queries. That is the most interesting finding in the project and also the least
-finished part of it. See [Reranker evaluation](#reranker-evaluation).
+**LLM reranking is worth far more than previously thought — on hard queries
+only.** +0.122 nDCG on held-out within-role queries, where an earlier
+measurement on an easier set had put it at +0.03. On easy queries it is flat,
+and a local cross-encoder *hurts* there. Reranker value turns out to be a
+property of how much retrieval left on the table, not of the reranker. See
+[Reranker evaluation](#reranker-evaluation-three-ways).
 
 ### Contents
 
@@ -76,7 +83,7 @@ finished part of it. See [Reranker evaluation](#reranker-evaluation).
 - [How it works](#how-it-works) — the pipeline, stage by stage
 - [Design decisions](#design-decisions) — what was chosen and what it cost
 - [Evaluation](#evaluation) — the benchmark, the dev/test split, and the bug in it
-- [Testing](#testing) — 230 tests and why the original 32 were worthless
+- [Testing](#testing) — 274 tests and why the original 32 were worthless
 - [Configuration](#configuration) — every environment variable
 - [Limitations](#limitations) — what this does not do, stated plainly
 - [Next steps](#next-steps)
@@ -187,7 +194,7 @@ Two things this surfaced that local runs never could:
 | `GET /api/v1/screenings/{job_id}` | Reopen a run with its decisions |
 | `PUT /api/v1/screenings/{job_id}/candidates/{id}/decision` | Shortlist / reject / maybe, with a note |
 | `GET /api/v1/screenings/{job_id}/shortlist.csv` | Export as CSV |
-| `GET /health` | Qdrant connectivity, model load, whether an LLM is configured |
+| `GET /health` | Qdrant connectivity, model load, which reranking backend is live |
 
 Ranking alone is not a usable tool. A recruiter needs to see who is in the pool,
 read the actual resume, record a decision, and come back to it tomorrow — so:
@@ -207,6 +214,14 @@ read the actual resume, record a decision, and come back to it tomorrow — so:
 - **SQLite, via stdlib `sqlite3`.** A run is a handful of small rows; Qdrant is a
   vector index rather than a record store, and adding Postgres would mean
   another service to deploy for no benefit.
+- **The reranking stage is swappable.** `api/reranker.py` (LLM),
+  `api/cross_encoder.py` (local) and a no-op all satisfy one contract, chosen by
+  `RERANKER_BACKEND`. They are interchangeable because they were built to be
+  *compared* — the same harness measures all three — and `/health` reports which
+  one is live, since an identical request returns a different ordering under
+  each and a bug report without that field is not reproducible. A backend that
+  was asked for and failed to load degrades to retrieval order and says so
+  loudly; it never silently becomes a different backend.
 
 ---
 
@@ -568,105 +583,170 @@ did not, and the corrected ones are above.
 
 **On the fixtures:** they are 255–304 words with three layout variants, including CVs with no recognisable headings at all — realistic enough for chunking strategies to differ, still shorter than a real 400–800 word CV. The short 55-word originals are what made every chunking strategy look identical, which is why the corpus was rebuilt.
 
-### Reranker evaluation
+### Reranker evaluation: three ways
 
-Everything above is LLM-free. Adding the reranker on top of the shipped
-configuration (window + hybrid, Groq `openai/gpt-oss-120b`, `temperature=0`):
+Everything above is LLM-free. There are now three ways to reorder the shortlist,
+selected with `RERANKER_BACKEND`:
 
-> **Read this table with its date on it.** It was measured against the
-> **original 15-query dev set**, before the dev set was expanded to 37 and
-> before a held-out set existed. The retrieval baselines it is compared against
-> (0.958 and 0.833) are therefore the *old* dev figures, not the current ones.
-> The qualitative result — reranking helps on hard queries, hurts on easy ones —
-> is what this section is for; the exact deltas are stale and are not repeated
-> elsewhere in this README. Re-measuring it on the current splits is item 1
-> under [Next steps](#next-steps).
-
-| | retrieval only | + reranking | |
+| backend | what it is | cost per query | reasoning text |
 |---|---|---|---|
-| **Cross-role** (the easy set) | | | |
-| recall@5 | 0.919 | 0.863 | **worse** |
-| precision@5 | 0.450 | 0.400 | **worse** |
-| nDCG@5 | 0.958 | 0.922 | **worse** |
-| MRR | 1.000 | 1.000 | — |
-| **Within-role** (the hard set) | | | |
-| recall@5 | 0.814 | 0.843 | better |
-| precision@5 | 0.743 | 0.771 | better |
-| nDCG@5 | 0.833 | 0.865 | better |
-| MRR | 0.905 | 0.905 | — |
+| `none` | hybrid retrieval order is final | 0 | no |
+| `cross-encoder` | local `ms-marco-MiniLM-L-6-v2`, 22M params | ~0.55 s, no API call | quotes the best-matching section |
+| `llm` (default) | Groq `openai/gpt-oss-120b`, `temperature=0` | ~1.5–2 s inference + an API call | yes, generated |
 
-**Reranking helps on hard queries and hurts on easy ones.** That is the most
-useful result in the project, and it is not a subtle effect.
+A cross-encoder is the standard middle ground: unlike the bi-encoder used for
+retrieval, it reads the job description and a CV passage *together*, so it can
+condition on the query — but it is a small classifier rather than a generative
+model, so it needs no key, no quota and no network.
 
-On cross-role queries retrieval already scored 0.958 on that set. A React CV and a
-Kubernetes CV are trivially different, so there is nothing left for the LLM to
-fix and every judgement it makes is another chance to be wrong about something
-already correct. On within-role queries retrieval scored 0.833 — sixteen Python
-backend engineers where the job turns on one requirement — and there the LLM
-reads that requirement properly.
+```bash
+python -m evaluation.run_eval --rerank all --split test
+```
 
-**The implication is a real optimisation, not just an observation.** Reranking
-costs ~1.5 s and an API call on *every* request, including the ones it makes
-slightly worse. A confidence gate — skip the LLM when the top retrieval score is
+#### nDCG@5, all three, both splits
+
+| | retrieval only | + cross-encoder | + LLM |
+|---|---|---|---|
+| **Cross-role dev** (20 q) | 0.890 | **0.942** | 0.935 |
+| **Within-role dev** (17 q) | 0.803 | 0.813 | *not measured — see below* |
+| **Cross-role test** (9 q) | **0.896** | 0.843 | 0.906 |
+| **Within-role test** (8 q) | 0.725 | 0.768 | **0.847** |
+
+Held-out detail, the set that actually discriminates:
+
+| within-role test | retrieval only | + cross-encoder | + LLM |
+|---|---|---|---|
+| recall@5 | 0.594 | 0.615 | **0.692** |
+| precision@5 | 0.450 | 0.475 | **0.525** |
+| nDCG@5 | 0.725 | 0.768 | **0.847** |
+| MRR | 0.938 | 0.906 | **1.000** |
+| mean rerank latency | — | 562 ms | 28.7 s wall clock¹ |
+
+¹ Dominated by rate-limit backoff, not inference — see [Latency](#latency).
+
+**1. On hard queries the LLM wins clearly, and by more than previously
+believed.** +0.122 nDCG on held-out within-role queries (0.725 → 0.847), with
+recall, precision and MRR all improving together and MRR reaching a perfect
+1.000 — the right person was first for all eight queries. An earlier version of
+this README reported the lift as **+0.03**. That figure came from the old
+15-query dev set where retrieval scored 0.833; on held-out queries retrieval
+scores 0.725, which leaves far more for the reranker to fix.
+
+**2. That is the same mechanism as before, pointing the other way.** The
+previously documented finding was that the reranker's value *shrank* as
+retrieval improved (+0.27 → +0.03). The corollary, now observed directly, is
+that it *grows* where retrieval is weaker. Reranker lift is not a property of
+the reranker; it is a property of how much stage one left on the table.
+
+**3. The cross-encoder captures roughly a third of the LLM's gain, at roughly a
+third of the inference time and none of the API cost.** +0.043 against +0.122 on
+held-out within-role nDCG; ~0.55 s locally against 1.5–2 s plus a billable call
+(and against ~25 s once a free tier starts throttling). If the choice
+is framed as quality per unit cost it wins comfortably; if it is framed as
+shortlist quality for a recruiter who has to live with the ranking, it does not.
+**It is not the shipped default** for that reason, but it is the right default
+for anyone without an API key, and `RERANKER_BACKEND=cross-encoder` makes it one
+environment variable away.
+
+**4. On easy queries, neither reranker is worth running.** Cross-role is where
+this is clearest: the LLM is flat (+0.045 dev, +0.010 test — inside noise), and
+the cross-encoder flips sign between splits (+0.052 dev, **−0.053** test). A
+result that changes direction between splits is not an effect; it is noise with
+a confident face on it. Retrieval already scores ~0.89 there, so there is
+nothing to fix and every judgement is a fresh chance to break something already
+correct.
+
+**5. The implication is a real optimisation, not just an observation.**
+Reranking costs an API call on *every* request including the ones it makes
+worse. A confidence gate — skip stage two when the top retrieval score is
 clearly separated from the rest — would cut both latency and spend on exactly
-the queries where reranking is not earning its cost. That is the next thing this
-project should do.
+the queries where reranking does not earn its cost. That is item 3 under
+[Next steps](#next-steps).
 
-#### The reranker's value shrank as retrieval improved
+#### The missing cell
 
-An earlier measurement put the within-role lift at **+0.27 nDCG**. It is now
-**+0.03**. Nothing regressed; retrieval got better.
+Within-role dev has no LLM figure because **the measurement failed and is not
+being reported as though it succeeded.** Groq's free tier allows 200,000 tokens
+per day; evaluating 54 queries across two splits exhausted it mid-run:
 
-| | retrieval nDCG@5 | reranker lift |
-|---|---|---|
-| section chunking, dense-only, 8 dev queries | 0.605 | +0.27 |
-| window chunking, hybrid, 15 dev queries | 0.833 | +0.03 |
+```
+Rate limit reached ... tokens per day (TPD): Limit 200000, Used 197974
+window + hybrid + LLM rerank  !! 13/17 NOT reranked   0.804
+```
 
-When retrieval scored 0.605 the LLM had a great deal to fix. Now most of that
-work happens upstream — cheaper, faster, and with no API call. **Improving stage
-one did not compound with stage two; it ate its margin.** The value of an
-expensive reranker is a function of how weak the cheap stage is, which is worth
-knowing before committing to one architecturally.
+13 of 17 queries fell back to retrieval order, so the 0.804 that row printed is
+*retrieval's* score wearing a reranker's label — it is within 0.001 of the
+retrieval-only 0.803, which is the tell. The harness flags this explicitly
+rather than averaging silently over failures, which is the entire reason that
+check exists: the number looked completely plausible.
 
-#### What the recall drop does and does not mean
+It is left blank until it can be measured properly. The held-out within-role
+figure is the one that matters anyway, and that run completed cleanly with all 8
+queries reranked.
 
-Cross-role recall@5 falls because the reranker promotes strong (grade 2) matches
-above partial (grade 1) ones, and recall@5 counts both as merely "relevant".
-Graded nDCG rewards that reordering; binary recall punishes it.
+**This is also a finding about the design, not just about a free tier.** A
+reranker that costs ~4,000 tokens per query cannot evaluate a 54-query benchmark
+twice a day on a free plan. That is a real constraint on iterating, and it is a
+large part of why a local cross-encoder is worth having even at a third of the
+quality.
 
-The demoted candidates are **not discarded** — they move below the k=5 cutoff and
-reappear at a higher `top_k`. Whether the behaviour is correct depends on the
-task: for a shortlist of the best few to interview it is what you want, for a
-longlist of everyone worth a look it is not.
+#### What the recall/precision pattern shows
 
-#### Confidence in these numbers
+On the held-out hard set all four metrics move the same way under the LLM, which
+is the clean case. The cross-encoder is less tidy: on **dev** within-role it
+*raises* nDCG (0.803 → 0.813) and MRR (0.931 → 0.971) while *lowering* recall@5
+(0.719 → 0.679) and precision@5 (0.612 → 0.576).
 
-One mostly-clean run: 13 of the 15 dev queries were reranked, the other two hit the
-daily token quota and fell back. **Treat it as a single observation, not a
-range.**
-
-Repeating it has not been possible. A full rerank pass costs roughly 55,000
-tokens and the Groq free tier allows 200,000/day, so about three runs — and the
-ablation sweeps consumed the budget before a clean repeat could be taken.
-
-Because a fully degraded run prints numbers shaped exactly like a result, the
-harness now labels them: a row reading `!! 7/7 NOT reranked` is retrieval-only
-output. That guard exists because such runs were briefly mistaken for data.
+That combination is not a contradiction. It means the cross-encoder pulls the
+single best candidate to the top — graded nDCG and MRR reward that — while
+pushing some merely-relevant people out of the top 5, which binary recall@5
+punishes. For a recruiter reading a ranked list top-down, "best person first,
+one fewer decent person on page one" is usually the better trade. It is worth
+knowing that is the trade being made, rather than reading a 0.01 nDCG gain as an
+unambiguous improvement.
 
 #### Latency
 
-Measured over live API requests with 3 candidates:
+| stage | cost | share |
+|---|---|---|
+| embedding the job description | 12–51 ms | <1% |
+| hybrid retrieval | 1.3–2.6 ms | <1% |
+| cross-encoder rerank | ~550 ms | ~95% when enabled |
+| LLM rerank (inference only) | 1.5–2.1 s | ~97% when enabled |
+| LLM rerank (observed wall clock) | 22–29 s | — |
 
-| stage | time |
-|---|---|
-| embed | 12 – 51 ms |
-| retrieve | 1.3 – 2.6 ms |
-| **rerank** | **1505 – 2113 ms** |
-| total | 1.5 – 2.2 s |
+**The 22–29 s figure needs its caveat stated, not buried.** It is what the
+harness measured, and it is real on this account, but it is mostly the retry
+logic sleeping through 60-second TPM windows on a free tier — not model latency.
+A single uncontended call takes 1.5–2.1 s. Quote 1.5–2 s for a paid tier and
+~25 s for a free one running a benchmark back-to-back; neither number alone is
+honest on its own.
 
-The LLM is ~97% of request time; retrieval is effectively free. Any latency work
-belongs at the reranking stage — and per the table above, the cheapest win is
-not doing it at all when retrieval is already confident.
+The fail-fast path is visible in the same data: once the *daily* quota was gone,
+mean rerank time dropped to 6.4 s rather than climbing, because a quota error
+asking the caller to wait 15 minutes is detected and abandoned instead of slept
+through. Retries are for per-minute limits only.
+
+#### Confidence in these numbers
+
+- **One run per configuration.** No repeats, so none of these figures has an
+  error bar. The LLM runs at `temperature=0` and the cross-encoder is fully
+  deterministic, so the *models* do not vary between runs — but which queries
+  hit a rate limit does.
+- **8 held-out within-role queries.** Enough to see +0.122 clearly. Not enough
+  to trust +0.043, and nowhere near enough to trust ±0.01.
+- **One LLM, one cross-encoder.** `openai/gpt-oss-120b` and
+  `ms-marco-MiniLM-L-6-v2`. These compare two specific models, not two
+  architectures in general.
+- **The cross-encoder is uncalibrated.** Its 0-1 score is a sigmoid of an
+  ms-marco relevance logit, trained for passage relevance rather than resume
+  fit. Observed values are extreme in both directions and sensitive to passage
+  length: on one hand-checked query a strong match scored 0.955 and a keyword-
+  dense distractor 0.016, while a shorter excerpt of the same strong CV scored
+  0.04. Ordering is meaningful; the absolute number is not a percentage match
+  and is not comparable to the LLM's. Calibration is deferred rather than
+  faked.
+
 
 ### Reproducing this
 
@@ -699,7 +779,7 @@ invalid key, so you can tell the two apart immediately.
 ## Testing
 
 ```bash
-python -m unittest discover -s tests -t . -v      # 230 tests
+python -m unittest discover -s tests -t . -v      # 274 tests
 ```
 
 Qdrant runs embedded, so the end-to-end tests need no server and run in CI.
@@ -723,7 +803,9 @@ Every value lives in `.env` — see `.env.example` for the annotated list. The o
 | Variable | Default | Purpose |
 |---|---|---|
 | `API_KEY` | — | Shared key for `X-API-Key`. **If unset, `/screen` is unauthenticated.** |
-| `GEMINI_API_KEY` / `GROQ_API_KEY` | — | At least one enables reranking. Gemini is tried first, Groq is the fallback. |
+| `GEMINI_API_KEY` / `GROQ_API_KEY` | — | At least one enables LLM reranking. Gemini is tried first, Groq is the fallback. |
+| `RERANKER_BACKEND` | `llm` | `llm`, `cross-encoder` (local, no key) or `none`. See [Reranker evaluation](#reranker-evaluation-three-ways). |
+| `CROSS_ENCODER_MODEL` | `cross-encoder/ms-marco-MiniLM-L-6-v2` | Cross-encoder weights, downloaded once (~90MB) and cached. |
 | `QDRANT_PATH` | — | Run Qdrant embedded from this directory (no server). |
 | `QDRANT_HOST` / `QDRANT_PORT` | `localhost` / `6333` | Qdrant server, when not embedded. |
 | `RETRIEVAL_CANDIDATES` | `30` | Distinct **candidates** retrieved for reranking (not chunks). |
@@ -742,7 +824,9 @@ Known and deliberate, rather than hidden:
 - **Reranker latency dominates and is not optimised.** Measured: embed 12–51 ms, retrieve 1.3–2.6 ms, rerank 1505–2113 ms — about 97% of request time, for only 3 candidates. It has not been measured with a full 30-candidate shortlist, and there is no batching, caching or timeout tuning.
 - **Model ids drift.** The Groq default is `openai/gpt-oss-120b`, verified working; the previous `llama-3.3-70b-versatile` now 404s. The Gemini default `gemini-2.5-flash` is **unverified** — no Gemini key was tested. Both are configurable via `GEMINI_MODEL` / `GROQ_MODEL`.
 - **Results are from one model on a small corpus.** The reranker numbers come from a single provider (Groq `openai/gpt-oss-120b`) over the *original* 15 dev queries and 32 synthetic CVs, and the +0.03 lift rests on one mostly-clean run. They show the pipeline works and that retrieval quality erodes the reranker's margin; they are not a general claim about reranking.
-- **The reranker has never been measured on held-out queries, or on the current dev set.** Retrieval has a clean held-out estimate; reranking has neither. Its +0.03 lift came from the original 15-query dev set, and retrieval has since been re-measured on 37 dev and 17 held-out queries. The reranker's true contribution is unknown rather than small.
+- **Every reranker figure is a single run.** The LLM runs at `temperature=0` and the cross-encoder is deterministic, so the models do not vary — but there are no error bars, and one within-role dev cell is missing entirely because a daily quota ran out mid-measurement.
+- **Reranking is compared across two specific models**, `openai/gpt-oss-120b` and `ms-marco-MiniLM-L-6-v2`. These are not general claims about LLMs versus cross-encoders.
+- **The cross-encoder's scores are uncalibrated.** Ordering is meaningful; the absolute 0–1 value is a sigmoid of a relevance logit, not a percentage match, and it is sensitive to how long the matched passage is.
 - **17 held-out queries is a thin test set.** It is enough to show a 0.22 nDCG effect and not enough to resolve a 0.05 one — as demonstrated when its 8 within-role queries ranked the shipped chunker third, and 17 dev queries then put it first. Treat the chunker ordering in the held-out table as noise, and single-digit differences anywhere in this README as undetermined.
 - **Relevance labels are author-assigned.** One person graded all 54 queries, with no second annotator and no inter-rater agreement measured. The grades encode a defensible reading of each role, not a consensus one.
 
@@ -750,18 +834,20 @@ Known and deliberate, rather than hidden:
 
 In rough priority order:
 
-1. **Re-measure the reranker on the current splits.** Retrieval now has a clean
-   held-out estimate; reranking does not have one at all. Its +0.03 lift was
-   measured on the original 15-query dev set, against retrieval baselines that
-   have since changed, so its real contribution is *unknown* rather than small.
-   This is the largest open question in the project.
-2. **Add a cross-encoder reranker** (`ms-marco-MiniLM-L-6-v2`) and compare three
-   ways — no reranking, cross-encoder, LLM — on nDCG, latency and cost. A local
-   cross-encoder costs no API call and ~30 ms rather than ~1.5 s, so if it
-   recovers most of the LLM's lift it is the better default.
-3. **Gate the reranker on retrieval confidence.** Reranking demonstrably hurts
-   on easy queries while costing 1.5 s and an API call on every request. Skip
-   the LLM when the top retrieval score is clearly separated from the rest.
-4. Repeat the reranker measurement across several runs, so the lift is a range rather than a single observation.
+1. **Fill the missing within-role dev LLM cell.** It needs one clean run on a
+   quota that is not already spent — see [The missing cell](#the-missing-cell).
+   Blocked on quota, not on code.
+2. **Gate the reranker on retrieval confidence.** Now the best-supported
+   optimisation in the project: reranking is flat-to-negative on cross-role
+   queries (LLM +0.010, cross-encoder −0.053 on held-out) while costing an API
+   call every time. Skip stage two when the top retrieval score is clearly
+   separated from the rest, and measure what it saves against what it costs.
+3. **Repeat each reranker measurement several times.** Every figure in the
+   reranker tables is a single run. The models are deterministic; which queries
+   hit a rate limit is not.
+4. **Calibrate the cross-encoder's scores.** ms-marco logits are trained for
+   passage relevance, not resume fit, and the sigmoid of a raw logit is not a
+   percentage. Fit a monotonic calibration on dev so the API's `score` means
+   something absolute and comparable across backends.
 5. Measure metadata-extraction accuracy against a labelled set, rather than spot-checking it.
 6. Pin `qdrant-client` more tightly. The Docker build resolved 1.19.1 against a `~=1.18` pin; it works, but a loose pin is exactly what broke `.search()` before.

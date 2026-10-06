@@ -3,10 +3,12 @@
 Builds a throwaway Qdrant index from the synthetic corpus, runs every labelled
 job description through the pipeline and reports ranking quality.
 
-    python -m evaluation.run_eval               # dev set, headline numbers
-    python -m evaluation.run_eval --ablations   # dev set, compare design choices
-    python -m evaluation.run_eval --rerank      # include the LLM reranker
-    python -m evaluation.run_eval --split test  # the held-out set (read once)
+    python -m evaluation.run_eval                  # dev set, headline numbers
+    python -m evaluation.run_eval --ablations      # dev set, compare design choices
+    python -m evaluation.run_eval --rerank         # add the LLM reranker
+    python -m evaluation.run_eval --rerank cross   # add the local cross-encoder
+    python -m evaluation.run_eval --rerank all     # three-way comparison
+    python -m evaluation.run_eval --split test     # the held-out set (read once)
 
 Queries are split into dev and test (see evaluation/corpus.py). Everything
 defaults to DEV, because every design decision in this project was made against
@@ -22,6 +24,7 @@ for latency on a real server, not for the ranking quality measured here.
 import argparse
 import shutil
 import tempfile
+import time
 import uuid
 from pathlib import Path
 
@@ -226,6 +229,7 @@ def evaluate_config(client, embedder, retriever_name: str, budget: int, k: int,
     per_query, distinct_counts = [], []
     degraded = 0
 
+    rerank_times = []
     for query in queries:
         vector = embedder.embed_text(query["job_description"])
         if retriever_name == "hybrid":
@@ -249,7 +253,13 @@ def evaluate_config(client, embedder, retriever_name: str, budget: int, k: int,
                 }
                 for cid, score in ranked
             ]
-            reranked = reranker.rerank(query["job_description"], candidates, top_k=len(candidates))
+            # Wall clock, because the point of comparing a cross-encoder to an
+            # LLM is the cost of the second stage, not just its quality.
+            started = time.perf_counter()
+            reranked = reranker.rerank(
+                query["job_description"], candidates, top_k=len(candidates)
+            )
+            rerank_times.append((time.perf_counter() - started) * 1000)
             ranked_ids = [r["candidate_id"] for r in reranked]
             # A rerank that silently degraded to vector scores must not be
             # reported as a reranker result. Every candidate carrying the
@@ -275,6 +285,9 @@ def evaluate_config(client, embedder, retriever_name: str, budget: int, k: int,
     result["avg_candidates_retrieved"] = sum(distinct_counts) / len(distinct_counts)
     result["queries"] = len(queries)
     result["degraded_queries"] = degraded
+    result["rerank_ms"] = (
+        sum(rerank_times) / len(rerank_times) if rerank_times else 0.0
+    )
     return result
 
 
@@ -284,6 +297,8 @@ def format_row(label: str, metrics: dict, k: int) -> str:
     degraded = metrics.get("degraded_queries", 0)
     if degraded:
         label = f"{label}  !! {degraded}/{metrics.get('queries', '?')} NOT reranked"
+    rerank_ms = metrics.get("rerank_ms", 0.0)
+    latency = f"{rerank_ms:>8.0f}" if rerank_ms else "       -"
     return (
         f"  {label:<34} "
         f"{metrics[f'recall@{k}']:.3f}   "
@@ -291,22 +306,31 @@ def format_row(label: str, metrics: dict, k: int) -> str:
         f"{metrics[f'ndcg@{k}']:.3f}   "
         f"{metrics['mrr']:.3f}  "
         f"{metrics['pool_recall']:.3f}      "
-        f"{metrics['avg_candidates_retrieved']:.1f}"
+        f"{metrics['avg_candidates_retrieved']:>4.1f} "
+        f"{latency}"
     )
 
 
 def header(k: int) -> str:
     return (
         f"  {'configuration':<34} {f'recall@{k}':<8} {f'prec@{k}':<10} "
-        f"{f'nDCG@{k}':<8} {'MRR':<6} {'pool_rec':<10} {'cands'}\n"
-        f"  {'-' * 92}"
+        f"{f'nDCG@{k}':<8} {'MRR':<6} {'pool_rec':<10} {'cands':<5} "
+        f"{'rerank_ms':>8}\n"
+        f"  {'-' * 102}"
     )
 
 
 def main() -> None:
     parser = argparse.ArgumentParser(description="Evaluate resume retrieval quality.")
     parser.add_argument("--ablations", action="store_true", help="compare design choices")
-    parser.add_argument("--rerank", action="store_true", help="include the LLM reranker")
+    parser.add_argument(
+        "--rerank",
+        nargs="?",
+        const="llm",
+        choices=("llm", "cross", "all"),
+        default=None,
+        help="add a reranking stage: llm (default when bare), cross, or all",
+    )
     parser.add_argument("--k", type=int, default=5, help="cutoff for @k metrics")
     parser.add_argument("--budget", type=int, default=10, help="retrieval budget")
     parser.add_argument(
@@ -341,8 +365,18 @@ def main() -> None:
         client = QdrantClient(path=str(workdir / "qdrant"))
         embedder = CVEmbedder()
 
-        reranker = None
-        if args.rerank:
+        # Ordered (label, reranker) pairs. Retrieval-only is always first so a
+        # reranker is read as a delta against it rather than in isolation.
+        stages = [("retrieval only", None)]
+        if args.rerank in ("cross", "all"):
+            from api.cross_encoder import CrossEncoderReranker
+
+            cross = CrossEncoderReranker()
+            if cross.is_configured:
+                stages.append(("+ cross-encoder", cross))
+            else:
+                print("!! cross-encoder could not be loaded; skipping it.\n")
+        if args.rerank in ("llm", "all"):
             # .env is loaded here, not at import, so the harness picks up keys
             # without mutating os.environ for anything that merely imports it.
             from dotenv import load_dotenv
@@ -350,10 +384,14 @@ def main() -> None:
             from api.reranker import CVReranker
 
             load_dotenv(dotenv_path=".env")
-            reranker = CVReranker()
-            if not reranker.is_configured:
-                print("!! --rerank requested but no LLM key configured; skipping rerank.\n")
-                reranker = None
+            llm = CVReranker()
+            if llm.is_configured:
+                stages.append(("+ LLM rerank", llm))
+            else:
+                print("!! LLM rerank requested but no key configured; skipping it.\n")
+
+        # Only the retrieval-only row: keep the old single-row output shape.
+        reranker = stages[-1][1] if len(stages) > 1 else None
 
         suites = [
             (
@@ -374,12 +412,17 @@ def main() -> None:
             for title, queries in suites:
                 print(title)
                 print(header(args.k))
-                metrics = evaluate_config(
-                    client, embedder, "hybrid", args.budget, args.k, reranker,
-                    queries=queries,
-                )
-                label = "window + hybrid" + (" + rerank" if reranker else "")
-                print(format_row(label, metrics, args.k))
+                for stage_label, stage in stages:
+                    metrics = evaluate_config(
+                        client, embedder, "hybrid", args.budget, args.k, stage,
+                        queries=queries,
+                    )
+                    label = (
+                        "window + hybrid"
+                        if stage is None
+                        else f"window + hybrid {stage_label}"
+                    )
+                    print(format_row(label, metrics, args.k))
                 print()
         else:
             for title, queries in suites:
@@ -399,16 +442,22 @@ def main() -> None:
                                 args.k,
                             )
                         )
-                if reranker:
+                if len(stages) > 1:
                     build_index(client, embedder, CHUNKERS["window"])
-                    metrics = evaluate_config(
-                        client, embedder, "hybrid", args.budget, args.k, reranker,
-                        queries=queries,
-                    )
-                    print(format_row("window   + hybrid   + LLM rerank", metrics, args.k))
+                    for stage_label, stage in stages[1:]:
+                        metrics = evaluate_config(
+                            client, embedder, "hybrid", args.budget, args.k, stage,
+                            queries=queries,
+                        )
+                        print(
+                            format_row(
+                                f"window   + hybrid   {stage_label}", metrics, args.k
+                            )
+                        )
                 print()
 
         print("cands = mean distinct candidates reaching the reranker (higher is better)")
+        print("rerank_ms = mean wall-clock cost of the reranking stage per query")
     finally:
         # Embedded Qdrant holds a file lock; drop the client before cleanup.
         try:
