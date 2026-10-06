@@ -83,7 +83,7 @@ property of how much retrieval left on the table, not of the reranker. See
 - [How it works](#how-it-works) — the pipeline, stage by stage
 - [Design decisions](#design-decisions) — what was chosen and what it cost
 - [Evaluation](#evaluation) — the benchmark, the dev/test split, and the bug in it
-- [Testing](#testing) — 274 tests and why the original 32 were worthless
+- [Testing](#testing) — 286 tests and why the original 32 were worthless
 - [Configuration](#configuration) — every environment variable
 - [Limitations](#limitations) — what this does not do, stated plainly
 - [Next steps](#next-steps)
@@ -656,12 +656,73 @@ a confident face on it. Retrieval already scores ~0.89 there, so there is
 nothing to fix and every judgement is a fresh chance to break something already
 correct.
 
-**5. The implication is a real optimisation, not just an observation.**
-Reranking costs an API call on *every* request including the ones it makes
-worse. A confidence gate — skip stage two when the top retrieval score is
-clearly separated from the rest — would cut both latency and spend on exactly
-the queries where reranking does not earn its cost. That is item 3 under
-[Next steps](#next-steps).
+**5. The obvious optimisation does not work, and that was tested before
+anything was built.** Reranking costs an API call on *every* request including
+the ones it makes worse, so the natural idea is a confidence gate: skip stage two
+when retrieval looks sure of itself. See
+[Why there is no confidence gate](#why-there-is-no-confidence-gate) — no
+serving-time signal predicted which queries reranking would help.
+
+#### Why there is no confidence gate
+
+The case for a gate looked strong: reranking is flat-to-negative on easy
+queries and costs an API call every time. So before building one,
+`evaluation/analyze_rerank_gate.py` asked a prior question — **does any signal
+available when a request arrives predict that reranking will help or hurt?**
+
+```bash
+python -m evaluation.analyze_rerank_gate
+```
+
+It runs on the 37 **dev** queries only (there is deliberately no `--split` flag;
+choosing a gate is a design decision, and design decisions are made on dev),
+using the local cross-encoder because it is free and deterministic. For each
+query it records the change in nDCG@5 from reranking, and the Spearman rank
+correlation between that change and seven candidate signals. The bar for
+adopting a gate, **ρ ≤ −0.40**, was fixed before looking at any result.
+
+| per query, dev, cross-encoder | n | mean Δ nDCG@5 | helped | hurt | unchanged |
+|---|---|---|---|---|---|
+| cross-role | 20 | +0.052 | 5 | 6 | 9 |
+| within-role | 17 | +0.010 | 9 | 8 | 0 |
+| **all** | **37** | **+0.033** | **14** | **14** | **9** |
+
+| signal (all available at serving time) | ρ with Δ nDCG |
+|---|---|
+| top-1 RRF score | −0.298 |
+| top-1 vs top-2 RRF margin | −0.033 |
+| top-10 / top-1 RRF ratio | +0.299 |
+| **top-1 dense cosine similarity** | **−0.344** (best) |
+| dense cosine, top-1 minus top-5 | −0.264 |
+| overlap of dense and BM25 top 5 | −0.238 |
+| dense and BM25 agree on the top result | −0.170 |
+| *baseline nDCG — needs relevance labels, so unusable* | *−0.436* |
+
+**No serving-time signal meets the bar.** The best, top-1 dense cosine at
+−0.344, has an uncorrected p-value of roughly 0.04 on 37 queries; after
+correcting for having compared seven signals it is about 0.26, which is not
+evidence of anything. The only variable that does correlate — how badly
+retrieval did — is the one that cannot be observed without labels.
+
+What the per-query picture says is more useful than the correlations. The
+cross-encoder helped 14 queries and hurt 14, and its +0.033 average is carried by
+a few large wins on queries where retrieval had failed badly (a recommendations
+query went from nDCG 0.15 to 0.88). **Reranking pays off precisely where
+retrieval is wrong, and nothing cheap tells you where that is.** RRF scores
+depend only on rank, so a wide score gap says how decisively the two retrievers
+agreed with each other, not whether the top result is right.
+
+**What this does and does not establish.** It establishes that a score-based gate
+cannot be justified for the cross-encoder on this corpus. It does *not* establish
+the same for the LLM reranker, whose per-query behaviour was not measured: that
+would cost about 4,000 tokens per query, and the free quota that already failed
+once cannot cover 37 of them. A better signal than the seven tried may exist, and
+a corpus of 32 CVs may be too small for any relationship to show. The honest
+position is "no evidence for a gate", not "gates cannot work".
+
+An earlier draft of this README listed the gate as the best-supported next step.
+That claim rested on the reranker being flat on *average* over easy queries,
+which does not imply it is predictable *per* query.
 
 #### The missing cell
 
@@ -779,7 +840,7 @@ invalid key, so you can tell the two apart immediately.
 ## Testing
 
 ```bash
-python -m unittest discover -s tests -t . -v      # 274 tests
+python -m unittest discover -s tests -t . -v      # 286 tests
 ```
 
 Qdrant runs embedded, so the end-to-end tests need no server and run in CI.
@@ -837,11 +898,13 @@ In rough priority order:
 1. **Fill the missing within-role dev LLM cell.** It needs one clean run on a
    quota that is not already spent — see [The missing cell](#the-missing-cell).
    Blocked on quota, not on code.
-2. **Gate the reranker on retrieval confidence.** Now the best-supported
-   optimisation in the project: reranking is flat-to-negative on cross-role
-   queries (LLM +0.010, cross-encoder −0.053 on held-out) while costing an API
-   call every time. Skip stage two when the top retrieval score is clearly
-   separated from the rest, and measure what it saves against what it costs.
+2. **Decide the reranking policy on cost, not on a gate.** A score-based gate
+   was tested and found unsupported (see
+   [Why there is no confidence gate](#why-there-is-no-confidence-gate)). What
+   remains is a plain choice: `llm` where quality on hard queries justifies the
+   spend, `cross-encoder` where it does not, `none` where neither does. Measuring
+   per-query LLM deltas, once there is quota to do it, is the only thing that
+   could reopen the gate question for the LLM.
 3. **Repeat each reranker measurement several times.** Every figure in the
    reranker tables is a single run. The models are deterministic; which queries
    hit a rate limit is not.
