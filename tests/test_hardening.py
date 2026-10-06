@@ -228,19 +228,33 @@ class CandidatePoolHonoursTopKTest(unittest.TestCase):
             os.environ.pop("RETRIEVAL_TOP_N", None)
             self.assertEqual(CVRetriever(client=MagicMock()).retrieval_candidates, 10)
 
+    def pool_warnings(self, pool):
+        """Pool-related warnings the retriever logs while being constructed.
+
+        Filters on the message rather than asserting 'no warnings at all': the
+        retriever also warns, unrelated to this, when no BM25 state file exists. A
+        developer machine has one and a fresh checkout (CI) does not, so an
+        all-warnings assertion passed locally and failed in CI.
+        """
+        with patch.dict(os.environ, {"RETRIEVAL_CANDIDATES": str(pool)}):
+            with patch("api.retriever.logger") as logger:
+                CVRetriever(client=MagicMock())
+        return [
+            str(call) for call in logger.warning.call_args_list
+            if "RETRIEVAL_CANDIDATES" in str(call)
+        ]
+
     def test_a_non_evaluated_pool_is_warned_about(self):
         """The default moved from 30 to 10, but an existing .env copied from the old
         .env.example keeps pinning 30, so the fix silently did nothing for every
         current setup until this was noticed from a log line saying retrieved=30."""
-        with patch.dict(os.environ, {"RETRIEVAL_CANDIDATES": "30"}):
-            with self.assertLogs("api.retriever", level="WARNING") as logs:
-                CVRetriever(client=MagicMock())
-        self.assertTrue(any("30" in line and "evaluation" in line for line in logs.output))
+        warnings = self.pool_warnings(30)
+        self.assertEqual(len(warnings), 1)
+        self.assertIn("30", warnings[0])
+        self.assertIn("evaluation", warnings[0])
 
     def test_the_evaluated_pool_is_not_warned_about(self):
-        with patch.dict(os.environ, {"RETRIEVAL_CANDIDATES": "10"}):
-            with self.assertNoLogs("api.retriever", level="WARNING"):
-                CVRetriever(client=MagicMock())
+        self.assertEqual(self.pool_warnings(10), [])
 
     def test_the_configured_pool_applies_by_default(self):
         results = self.retriever(5).search_candidates([1.0, 0.0, 0.0, 0.0], filters=None)
