@@ -83,7 +83,7 @@ property of how much retrieval left on the table, not of the reranker. See
 - [How it works](#how-it-works) — the pipeline, stage by stage
 - [Design decisions](#design-decisions) — what was chosen and what it cost
 - [Evaluation](#evaluation) — the benchmark, the dev/test split, and the bug in it
-- [Testing](#testing) — 286 tests and why the original 32 were worthless
+- [Testing](#testing) — 298 tests and why the original 32 were worthless
 - [Configuration](#configuration) — every environment variable
 - [Limitations](#limitations) — what this does not do, stated plainly
 - [Next steps](#next-steps)
@@ -185,7 +185,7 @@ Two things this surfaced that local runs never could:
 
 | | |
 |---|---|
-| `POST /api/v1/screen` | Rank candidates against a job description |
+| `POST /api/v1/screen` | Rank candidates against a job description; returns `reranked` and per-stage `timings` |
 | `GET /api/v1/candidates` | Browse the pool, paginated and filterable |
 | `GET /api/v1/candidates/stats` | What is indexed: counts, locations, experience spread |
 | `GET /api/v1/candidates/{id}` | One candidate, including the text actually indexed |
@@ -194,7 +194,7 @@ Two things this surfaced that local runs never could:
 | `GET /api/v1/screenings/{job_id}` | Reopen a run with its decisions |
 | `PUT /api/v1/screenings/{job_id}/candidates/{id}/decision` | Shortlist / reject / maybe, with a note |
 | `GET /api/v1/screenings/{job_id}/shortlist.csv` | Export as CSV |
-| `GET /health` | Qdrant connectivity, model load, which reranking backend is live |
+| `GET /health` | Qdrant connectivity, model load, which reranking backend is live, and whether an LLM is configured |
 
 Ranking alone is not a usable tool. A recruiter needs to see who is in the pool,
 read the actual resume, record a decision, and come back to it tomorrow — so:
@@ -214,6 +214,15 @@ read the actual resume, record a decision, and come back to it tomorrow — so:
 - **SQLite, via stdlib `sqlite3`.** A run is a handful of small rows; Qdrant is a
   vector index rather than a record store, and adding Postgres would mean
   another service to deploy for no benefit.
+- **The response says how the ranking was produced.** `reranked` is true if at
+  least one candidate was scored by the reranker and false if the order is plain
+  retrieval order — because the provider was down, the quota ran out, or the
+  `none` backend is configured. The fallback is the right behaviour, but without
+  the flag a degraded ranking looks identical to a good one, and silent
+  degradation is the failure class this project kept finding. `timings` gives
+  embed, retrieve and rerank cost per request. Both were originally stored with
+  the screening but missing from the search response, which was found by running
+  the real flow end to end rather than by a test.
 - **The reranking stage is swappable.** `api/reranker.py` (LLM),
   `api/cross_encoder.py` (local) and a no-op all satisfy one contract, chosen by
   `RERANKER_BACKEND`. They are interchangeable because they were built to be
@@ -840,7 +849,7 @@ invalid key, so you can tell the two apart immediately.
 ## Testing
 
 ```bash
-python -m unittest discover -s tests -t . -v      # 286 tests
+python -m unittest discover -s tests -t . -v      # 298 tests
 ```
 
 Qdrant runs embedded, so the end-to-end tests need no server and run in CI.

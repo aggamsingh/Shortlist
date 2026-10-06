@@ -65,6 +65,19 @@ class ScreenResponse(BaseModel):
         ..., description="Matched candidates, best first"
     )
     screened_at: str = Field(..., description="ISO 8601 UTC timestamp of screening")
+    reranked: bool = Field(
+        False,
+        description=(
+            "True if at least one candidate was scored by the reranker. False means "
+            "the order is plain retrieval order: the reranker was unavailable, "
+            "failed, or the 'none' backend is configured. Without this, a degraded "
+            "ranking is indistinguishable from a good one."
+        ),
+    )
+    timings: dict = Field(
+        default_factory=dict,
+        description="Per-stage wall-clock cost in milliseconds (embed, retrieve, rerank).",
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -137,7 +150,7 @@ class ScreeningSummary(BaseModel):
     job_description_preview: str
     candidate_count: int
     shortlisted_count: int
-    reranked: bool = Field(..., description="False means the LLM was unavailable")
+    reranked: bool = Field(..., description="False means no candidate was scored by the reranker")
     created_at: str
 
 

@@ -305,7 +305,9 @@ async def screen_resumes(request: ScreenRequest):
     return ScreenResponse(
         job_id=job_id,
         candidates=candidate_matches,
-        screened_at=screened_at
+        screened_at=screened_at,
+        reranked=reranked,
+        timings=timings,
     )
 
 @app.get(
@@ -339,7 +341,10 @@ async def health_check():
             
     # Ask the reranker itself, so placeholder keys from .env.example are not
     # reported as a working LLM configuration.
-    if reranker and reranker.is_configured:
+    # Only the LLM backend can be "LLM configured". The cross-encoder also
+    # reports is_configured (its weights loaded), and calling that an LLM would
+    # tell an operator a key exists when none is involved.
+    if isinstance(reranker, CVReranker) and reranker.is_configured:
         details["llm_configured"] = True
     if reranker is not None:
         # Which backend is running is operationally important: an identical
