@@ -357,6 +357,13 @@ def main() -> None:
              "--split test only)",
     )
     parser.add_argument(
+        "--query-style",
+        choices=("jd", "title", "keywords"),
+        default="jd",
+        help="query form: the full job description (default), a short keyword "
+             "phrase, or the job title alone (cross-role queries only)",
+    )
+    parser.add_argument(
         "--jd-filter",
         action="store_true",
         help="strip boilerplate from the job description before retrieval, as the "
@@ -370,6 +377,9 @@ def main() -> None:
         check_allowed(args.jd_style, args.split)
     except ValueError as error:
         parser.error(str(error))
+    if args.query_style != "jd" and (args.jd_style != "plain" or args.jd_filter):
+        parser.error("--query-style title/keywords cannot be combined with "
+                     "--jd-style or --jd-filter: those act on full job descriptions")
 
     stats = corpus_stats(args.split)
     print("Shortlist - retrieval evaluation")
@@ -442,6 +452,23 @@ def main() -> None:
             )
             for title, qs in suites
         ]
+
+        if args.query_style != "jd":
+            from evaluation.short_queries import short_text
+
+            shortened = []
+            for title, qs in suites:
+                kept = []
+                for q in qs:
+                    text = short_text(q["id"], args.query_style)
+                    if text:
+                        kept.append(dict(q, job_description=text))
+                if len(kept) < len(qs):
+                    print(f"{title.split(' (')[0]}: {len(kept)} of {len(qs)} queries "
+                          f"have a '{args.query_style}' form")
+                shortened.append((title, kept))
+            suites = [(t, q) for t, q in shortened if q]
+            print(f"query style: {args.query_style} (a short phrase, not a job description)\n")
 
         jd_filter = None
         if args.jd_filter:

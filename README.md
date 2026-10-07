@@ -84,7 +84,7 @@ property of how much retrieval left on the table, not of the reranker. See
 - [Design decisions](#design-decisions) — what was chosen and what it cost
 - [Evaluation](#evaluation) — the benchmark, the dev/test split, and the bug in it
 - [Stress testing](#stress-testing-what-broke-under-load-attack-and-realistic-input) — what broke under load, attack and realistic input
-- [Testing](#testing) — 404 tests and why the original 32 were worthless
+- [Testing](#testing) — 414 tests and why the original 32 were worthless
 - [Configuration](#configuration) — every environment variable
 - [Limitations](#limitations) — what this does not do, stated plainly
 - [Next steps](#next-steps)
@@ -959,6 +959,74 @@ are my own writing, not a sample of real postings, so they show that boilerplate
 hurts and that a filter helps, not by how much on real data. Only retrieval uses
 the filtered text; the reranker still sees the original.
 
+#### Short queries, and what a visitor actually types
+
+Every query measured so far was a full job description. A search box gets
+"python vector database", so that was measured too, with hand-written short forms of
+all 54 queries (`evaluation/short_queries.py`), written before any retrieval output
+was looked at:
+
+```bash
+python -m evaluation.run_eval --split dev  --rerank cross --query-style keywords
+python -m evaluation.run_eval --split test --rerank cross --query-style keywords   # held-out, read once
+python -m evaluation.run_eval --split dev  --rerank cross --query-style title      # cross-role only
+```
+
+- **keywords**: the role plus the skills that matter, 3 to 8 words. Defined for every
+  query, so the narrow within-role labels stay valid.
+- **title**: the job title alone, 2 to 4 words, only for the cross-role queries.
+  Within-role queries have no title form on purpose: "python backend engineer" fits
+  sixteen CVs and only two or three are labelled strong, so scoring it against those
+  labels would mark thirteen right answers wrong.
+
+The bar was fixed first: keyword queries at MRR 0.80 or better, nDCG@5 of 0.70
+within-role and 0.80 cross-role; title queries at MRR 0.70. All were cleared.
+
+| hybrid nDCG@5 (MRR) | cross-role | within-role |
+|---|---|---|
+| dev, full job description | 0.890 (0.975) | 0.803 (0.931) |
+| dev, **keywords** | 0.873 (0.950) | 0.785 (0.941) |
+| dev, **title only** (19 queries) | 0.703 (0.866) | n/a |
+| held-out, full job description | 0.896 (1.000) | 0.725 (0.938) |
+| held-out, **keywords** | 0.853 (1.000) | **0.729** (1.000) |
+| held-out, **title only** (9 queries) | 0.749 (0.917) | n/a |
+
+Keyword queries are nearly as good as full descriptions: on held-out within-role
+queries they match (0.729 against 0.725). With the cross-encoder on top, keywords
+reach 0.903 / 0.852 on dev and 0.836 / 0.807 held-out; MRR is 1.000 throughout. Title
+alone is weaker (nDCG about 0.75) but still puts a right answer first most of the time.
+
+**Caveat:** the labels were written for the full job descriptions. They are a good
+proxy for the short forms, not a fresh set of judgements, and a short query is more
+ambiguous than the paragraph it came from.
+
+*What a visitor does is not what a benchmark does.* Thirty-three unlabelled queries
+(single words, typos, abbreviations, conversational phrasing, jobs the corpus does not
+cover, nonsense) were run through the real API and read by hand. This is a probe, not
+a metric.
+
+| kind | outcome |
+|---|---|
+| role words and phrases ("senior python engineer in Bangalore", "SRE", "DevOps", "full-stack", "JS frontend dev", "reactjs developer") | right people first |
+| conversational ("looking for someone who knows machine learning") | right people first, but the score reads 0.01 |
+| single skills ("python", "react", "java") | sensible, and "kubernetes" is ambiguous (several unrelated roles score 0.96 or higher) |
+| **typos** ("pyhton developer", "machin learning") | **weak**: scores 0.00, and "pyhton developer" puts a frontend developer in its top three |
+| **abbreviations** ("k8s", "data eng") | **weak**: "k8s" returns a backend engineer first |
+| **jobs not in the corpus** ("nurse", "pastry chef", "lawyer", ...) and nonsense | all score 0.00, but still return a ranked list |
+
+**The cross-encoder's score cannot be shown as a percentage.** It reads 0.00 for
+nonsense and also for "machin learning" and "k8s", queries the system answers
+partly or fully correctly. It is a ranking signal, not a match percentage.
+
+**A single signal cannot reject out-of-corpus queries safely.** Top-1 dense cosine
+for nonsense is 0.18 to 0.22 and for out-of-corpus jobs 0.19 to 0.38, but real
+labelled keyword queries span 0.21 to 0.54, and "full-stack" scores 0.21. BM25 term
+matching overlaps too ("k8s" matches nothing). A combination (cosine below 0.40 and
+cross-encoder score below 0.05) would catch every out-of-corpus and nonsense query in
+the probe, but it was read off the same 33 queries, so it is a heuristic to show as
+"no strong match, closest candidates", not a validated rule, and it would also fire on
+a few weakly-phrased queries that were answered correctly.
+
 #### Keyword stuffing
 
 An applicant pastes the job description into their CV, often in white text. One
@@ -1105,6 +1173,7 @@ Image-only PDFs are skipped, not read: there is no OCR.
 #### What stress testing did not cover
 
 - Shuffled keyword soup is flagged, not stopped.
+- Short queries were measured with hand-written phrasings and labels borrowed from the full job descriptions; typos and abbreviations are weak and no abbreviation handling exists.
 - Hidden-text detection in PDF and DOCX files is not built.
 - The boilerplate styles are my own writing, not real postings, and the filter
   recovers about 60% of the loss.
@@ -1147,7 +1216,7 @@ invalid key, so you can tell the two apart immediately.
 ## Testing
 
 ```bash
-python -m unittest discover -s tests -t . -v      # 404 tests
+python -m unittest discover -s tests -t . -v      # 414 tests
 ```
 
 Qdrant runs embedded, so the end-to-end tests need no server and run in CI.
